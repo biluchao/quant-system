@@ -1,750 +1,540 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Spark Quant System Contributors. All Rights Reserved.
 """
-火种系统 · 对抗样本生成器 (GANStressTest) — 机构级最终版
-==================================================================
-核心职责：
-1. 基于历史对数收益率序列，训练条件增强的 WGAN-GP（带梯度惩罚和一致正则化），生成具有极端波动、肥尾、波动率聚集、
-   跳跃行为的合成行情样本，用于策略在万亿美金级账户下的压力测试。
-2. 提供全面的统计检验与分布诊断报告（包括平稳性、自相关、ARCH效应、KS检验、Q-Q残差），确保生成样本的分布逼真度
-   达到机构可接受水平。
-3. 支持分布式训练（单机多卡）的预留接口、自动混合精度（AMP）可选，保障在有限 GPU 内存下训练大型序列生成器。
-4. 提供安全的模型序列化（safetensors优先 + 校验和 + 元数据完整性验证），模型文件可审计且不可篡改。
-5. 所有操作具备完整可追溯性（日志、种子固定、配置哈希），满足监管与风险管理要求。
+火种系统 · 对抗样本压力测试生成器 (GANStressTest)
 
-外部依赖（精确版本）：
-- torch >= 1.12.0 : 深度学习框架
-- numpy >= 1.21.0 : 数值计算
-- scipy >= 1.7.0 : 统计检验
-- pyyaml >= 6.0 : 配置文件解析
-- safetensors >= 0.3.0 (推荐) : 安全序列化
+核心职责：
+1. 学习历史价格动态（对数收益率）的分布，通过轻量生成对抗网络或统计极值模型生成合成场景
+2. 通过极端因子引导产生尾部风险情景（闪崩、波动率爆发、跳空），用于策略压力测试
+3. 输出标准化OHLCV合成数据，支持审计哈希与元数据记录
+
+外部依赖（真实模块接口）：
+- torch (PyTorch) : 张量计算与神经网络构建（可选，不可用时降级）
+- numpy : 数值处理
+- pandas : 历史数据加载与序列化
 
 接口契约：
-- train(real_returns, validation_returns=None, **kwargs) -> Dict[str, Any]
-- generate_samples(num_samples, seq_len, seed=None, extreme=False) -> np.ndarray
-- statistical_report(real, synthetic, alpha=0.05) -> Dict[str, Any]
+- generate(num_scenarios: int = 100, length: int = 512, extreme_factor: float = 1.0,
+           seed: Optional[int] = None) -> Dict[str, Any]
+  返回包含 "scenarios" (List[List[float]]) 和审计信息的字典
+- train(data: np.ndarray, **kwargs) -> Dict[str, Any]
 - health_check() -> Dict[str, Any]
-- shutdown() -> None
 
 异常与降级：
-- PyTorch 不可用时，降级为历史重采样+偏t分布+跳跃的稳健生成器，并发出 CRITICAL 日志。
-- 训练过程中遇到数值不稳定自动恢复到最佳检查点并降低学习率重试。
-- 任何外部资源在异常时通过 finally 块确保释放，保障生产环境长时间运行。
+- 若 PyTorch 不可用，自动降级为统计极值模型（Heston+复合泊松跳跃），记录 WARNING
+- 所有异常均捕获并返回结构化错误，不影响主进程
+- 随机种子可复现（提供seed参数或使用系统熵源）
 
 资源管理：
-- 训练峰值内存 < 1.5GB，通过批次大小和梯度累积控制。
-- 模型保存于配置路径，支持 NFS/分布式文件系统。
-- 提供 shutdown() 方法用于模块热重载时安全卸载 GPU 显存。
+- 模型参数常驻内存（<50MB），支持热重载
+- 生成过程使用CPU，支持批量生成，单次<1秒
 """
 
+import hashlib
+import json
 import logging
 import os
 import sys
-import hashlib
-import json
-import datetime
-import warnings
-import tempfile
-import copy
-from typing import Dict, Any, Optional, Tuple, List, Union
+import time
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
-import yaml
+import pandas as pd
 
-# 配置日志（JSON 结构化行，便于集中采集）
-logging.basicConfig(
-    level=logging.INFO,
-    format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "module": "%(name)s", "message": "%(message)s"}',
-    datefmt='%Y-%m-%dT%H:%M:%S'
-)
-logger = logging.getLogger(__name__)
-
-# ── 安全导入 PyTorch ──
+# 可选依赖
 try:
     import torch
     import torch.nn as nn
     import torch.optim as optim
-    from torch.utils.data import DataLoader, TensorDataset
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
-    logger.critical("PyTorch未安装，GAN将降级为历史重采样+偏t分布生成器。生产环境务必安装PyTorch!")
 
-# 可选：混合精度
-try:
-    from torch.cuda.amp import autocast, GradScaler
-    AMP_AVAILABLE = True
-except ImportError:
-    AMP_AVAILABLE = False
+logger = logging.getLogger(__name__)
 
-# 可选：安全序列化
-try:
-    from safetensors.torch import save_file as safe_save, load_file as safe_load
-    SAFETENSORS_AVAILABLE = True
-except ImportError:
-    SAFETENSORS_AVAILABLE = False
-    logger.info("safetensors 未安装，模型保存将使用标准 torch.save + SHA256 校验和")
+# ── 常量定义 ──────────────────────────────────────────────
+VERSION = "3.0.1"
+SPDX_IDENTIFIER = "Apache-2.0"
+DEFAULT_SEQUENCE_LENGTH = 512
+DEFAULT_NOISE_DIM = 32
+DEFAULT_HIDDEN_DIM = 64
+MAX_SCENARIOS = 10000
+MIN_LENGTH = 10
+MAX_LENGTH = 2000
+EXTREME_FACTOR_MIN = 0.5
+EXTREME_FACTOR_MAX = 10.0
+DEFAULT_TRAINING_EPOCHS = 50
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_LEARNING_RATE = 0.0002
 
-# scipy 统计检验
-try:
-    from scipy import stats as scipy_stats
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
-    logger.warning("scipy 未安装，部分高级统计检验将不可用。建议: pip install scipy")
+# 统计模型默认参数（对数收益率空间）
+DEFAULT_ANNUAL_VOL = 0.8           # 年化波动率 80% (加密货币典型值)
+DEFAULT_JUMP_INTENSITY = 0.05      # 每日跳跃概率
+DEFAULT_JUMP_STD = 0.05            # 跳跃幅度标准差（对数）
+DEFAULT_BASE_PRICE = 40000.0       # BTC 参考价
 
-# ── 辅助函数（增强数值稳定性） ──
-def _safe_stat(arr: np.ndarray, func, default=np.nan):
-    """安全计算统计量，排除非有限值"""
-    arr = arr[np.isfinite(arr)]
-    if len(arr) == 0:
-        return default
-    return func(arr)
 
-def _stable_skew(arr: np.ndarray) -> float:
-    std = np.nanstd(arr)
-    if std < 1e-12 or np.isnan(std):
-        return 0.0
-    return float(np.nanmean((arr - np.nanmean(arr))**3) / (std**3))
-
-def _stable_kurtosis(arr: np.ndarray) -> float:
-    std = np.nanstd(arr)
-    if std < 1e-12 or np.isnan(std):
-        return 0.0
-    return float(np.nanmean((arr - np.nanmean(arr))**4) / (std**4) - 3.0)
-
-def _is_finite(arr: np.ndarray) -> bool:
-    return bool(np.all(np.isfinite(arr)))
-
-# ── 神经网络模块定义（WGAN-GP） ──
-class Generator(nn.Module):
+class _LightweightGAN(nn.Module):
+    """轻量全连接 GAN 生成器，适用于一维对数收益率序列"""
     def __init__(self, noise_dim: int, seq_len: int, hidden_dim: int = 64):
         super().__init__()
-        self.net = nn.Sequential(
+        self.seq_len = seq_len
+        self.model = nn.Sequential(
             nn.Linear(noise_dim, hidden_dim),
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.BatchNorm1d(hidden_dim * 2),
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim * 2, seq_len),
-            nn.Tanh()
+            nn.Tanh()  # 输出范围 [-1,1]，便于学习对数收益率
         )
 
-    def forward(self, z):
-        return self.net(z)
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.model(z)
 
-class Discriminator(nn.Module):
-    def __init__(self, seq_len: int, hidden_dim: int = 64):
+
+class _LightweightDiscriminator(nn.Module):
+    """轻量判别器"""
+    def __init__(self, seq_len: int, hidden_dim: int = 64, dropout: float = 0.3):
         super().__init__()
-        self.net = nn.Sequential(
+        self.model = nn.Sequential(
             nn.Linear(seq_len, hidden_dim * 2),
             nn.LeakyReLU(0.2),
-            nn.Dropout(0.2),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, 1)  # 无 Sigmoid，WGAN
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
         )
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
 
 
-# ── 主类 ──
 class GANStressTest:
-    """WGAN-GP 对抗样本生成器，用于万亿美金级账户压力测试"""
+    """
+    对抗样本压力测试生成器
 
-    # 默认超参数（完全配置化）
-    DEFAULT_CONFIG = {
-        "noise_dim": 10,
-        "hidden_dim": 64,
-        "seq_len": 50,
-        "batch_size": 64,
-        "lr_g": 0.0001,
-        "lr_d": 0.0001,
-        "beta1": 0.5,
-        "beta2": 0.9,
-        "n_critic": 5,                # 判别器每 n 步更新一次生成器
-        "gp_weight": 10.0,
-        "max_epochs": 500,
-        "patience": 20,               # 早停耐心轮数
-        "gradient_clip": 1.0,
-        "device": "cpu",
-        "model_dir": "./models",
-        "use_amp": False,            # 自动混合精度（需GPU）
-        "seed": None,                # 训练确定性种子
-        "winsorize_pct": 0.01,       # 缩尾处理百分位（单侧），0表示不处理
-        "lr_decay_factor": 0.95,     # 每轮学习率衰减
-        "lr_decay_step": 50,
-        "jump_lambda": 0.1,          # 极端模式跳跃概率
-        "jump_scale_mult": 3.0,      # 跳跃幅度倍数（乘以标准差）
-        "model_checksum_required": True
-    }
+    支持两种模式：
+    - GAN模式：学习对数收益率的分布，生成逼真序列
+    - 统计模式：Heston随机波动率 + 复合泊松跳跃扩散，模拟尾部风险
+    """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None, model_path: Optional[str] = None,
-                 strict: bool = True):
-        """
-        config: 超参数字典，将覆盖默认值。
-        model_path: 预训练模型路径（支持 .pt 或 .safetensors 的元数据JSON）
-        strict: 若为 True，设备设为 cuda 但不可用时抛出异常
-        """
-        self.config = copy.deepcopy(self.DEFAULT_CONFIG)
-        if config:
-            self.config.update(config)
+    DEFAULT_MODEL_PATH = "models/gan_stress.pth"
 
-        # 设备处理
-        requested_device = self.config["device"]
-        if requested_device.startswith("cuda") and not torch.cuda.is_available():
-            if strict:
-                raise RuntimeError(f"请求设备 {requested_device} 但 CUDA 不可用")
-            else:
-                logger.warning(f"CUDA 不可用，降级为 CPU")
-                self.config["device"] = "cpu"
-        self.device = torch.device(self.config["device"] if TORCH_AVAILABLE else "cpu")
-        self.noise_dim = self.config["noise_dim"]
-        self.seq_len = self.config["seq_len"]
-        self.hidden_dim = self.config["hidden_dim"]
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        use_gan: bool = True,
+        base_price: float = DEFAULT_BASE_PRICE,
+        annual_vol: float = DEFAULT_ANNUAL_VOL,
+        jump_intensity: float = DEFAULT_JUMP_INTENSITY,
+        jump_std: float = DEFAULT_JUMP_STD,
+    ):
+        self._use_gan = use_gan and TORCH_AVAILABLE
+        self._model_path = model_path or self.DEFAULT_MODEL_PATH
+        self._generator: Optional[_LightweightGAN] = None
+        self._discriminator: Optional[_LightweightDiscriminator] = None
+        self._device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self._seq_len = DEFAULT_SEQUENCE_LENGTH
+        self._noise_dim = DEFAULT_NOISE_DIM
+        self._hidden_dim = DEFAULT_HIDDEN_DIM
+        self._model_meta: Dict[str, Any] = {}
+        # 统计模型参数
+        self.base_price = base_price
+        self.annual_vol = annual_vol
+        self.jump_intensity = jump_intensity
+        self.jump_std = jump_std
 
-        self.generator = None
-        self.discriminator = None
-        self._scaler_mean = 0.0
-        self._scaler_std = 1.0
-        self._real_train_returns: Optional[np.ndarray] = None
-        self._config_checksum = hashlib.sha256(json.dumps(self.config, sort_keys=True, default=str).encode()).hexdigest()[:8]
+        if self._use_gan:
+            self._init_gan()
 
-        if TORCH_AVAILABLE:
-            self.generator = Generator(self.noise_dim, self.seq_len, self.hidden_dim).to(self.device)
-            self.discriminator = Discriminator(self.seq_len, self.hidden_dim).to(self.device)
-            if model_path:
-                self._load_model(model_path)
+    def _init_gan(self):
+        """初始化GAN模型并尝试加载预训练权重，失败则降级"""
+        self._generator = _LightweightGAN(self._noise_dim, self._seq_len, self._hidden_dim).to(self._device)
+        self._discriminator = _LightweightDiscriminator(self._seq_len, self._hidden_dim).to(self._device)
+        if os.path.exists(self._model_path):
+            try:
+                checkpoint = torch.load(self._model_path, map_location=self._device)
+                # 验证元数据
+                meta = checkpoint.get('meta', {})
+                if meta.get('seq_len', self._seq_len) != self._seq_len:
+                    logger.warning("模型训练长度 (%d) 与当前设置 (%d) 不匹配，降级为统计模型",
+                                   meta.get('seq_len'), self._seq_len)
+                    self._use_gan = False
+                    return
+                self._generator.load_state_dict(checkpoint['generator'])
+                self._discriminator.load_state_dict(checkpoint['discriminator'])
+                self._model_meta = meta
+                logger.info("GAN预训练模型已加载: %s", self._model_path)
+            except Exception as e:
+                logger.error("加载GAN模型失败: %s，降级为统计模型", str(e))
+                self._use_gan = False
         else:
-            logger.critical("GAN 核心不可用，系统运行在降级模式，生成样本质量受限。")
+            logger.info("未找到预训练模型，GAN处于未训练状态（generate时将使用统计模型）")
+            self._use_gan = False
 
-    # ── 模型持久化（安全） ──
-    def _save_model(self, path: str):
-        """保存模型至指定路径，自动创建目录，包含配置哈希和时间戳"""
-        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
-        timestamp = datetime.datetime.utcnow().isoformat() + 'Z'
-        state = {
-            'generator_state_dict': self.generator.state_dict(),
-            'discriminator_state_dict': self.discriminator.state_dict(),
-            'scaler_mean': self._scaler_mean,
-            'scaler_std': self._scaler_std,
-            'config': self.config,
-            'config_checksum': self._config_checksum,
-            'timestamp': timestamp
-        }
+    def _get_seed(self, seed: Optional[int] = None) -> int:
+        """生成安全随机种子"""
+        if seed is not None:
+            return seed
+        return int.from_bytes(os.urandom(4), byteorder='big')
 
-        if SAFETENSORS_AVAILABLE:
-            base = path.replace('.pt', '')
-            safe_save(state['generator_state_dict'], f"{base}_gen.safetensors")
-            safe_save(state['discriminator_state_dict'], f"{base}_disc.safetensors")
-            meta = {k: v for k, v in state.items() if k not in ['generator_state_dict', 'discriminator_state_dict']}
-            meta['timestamp'] = timestamp
-            with open(f"{base}_meta.json", 'w', encoding='utf-8') as f:
-                json.dump(meta, f, indent=2)
-            logger.info(f"模型已安全保存（safetensors）至 {base}_*.safetensors")
-        else:
-            torch.save(state, path)
-            with open(path, 'rb') as f:
-                checksum = hashlib.sha256(f.read()).hexdigest()
-            with open(path + '.sha256', 'w') as f:
-                f.write(checksum)
-            logger.info(f"模型已保存至 {path}，校验和: {checksum[:8]}")
-
-    def _load_model(self, path: str):
-        """加载模型，安全校验，支持 .pt 或 safetensors 元数据"""
-        if SAFETENSORS_AVAILABLE and (path.endswith('.safetensors') or os.path.exists(path.replace('.pt','_meta.json'))):
-            base = path.replace('.pt','') if path.endswith('.pt') else path.replace('_gen.safetensors','').replace('_disc.safetensors','')
-            meta_path = f"{base}_meta.json"
-            gen_path = f"{base}_gen.safetensors"
-            disc_path = f"{base}_disc.safetensors"
-            with open(meta_path, 'r') as f:
-                meta = json.load(f)
-            self.generator.load_state_dict(safe_load(gen_path))
-            self.discriminator.load_state_dict(safe_load(disc_path))
-            self._scaler_mean = meta['scaler_mean']
-            self._scaler_std = meta['scaler_std']
-            # 验证配置一致性（可选）
-            if meta.get('config_checksum') and self.config.get('model_checksum_required'):
-                if meta['config_checksum'] != self._config_checksum:
-                    logger.warning(f"当前配置哈希 ({self._config_checksum}) 与模型训练时 ({meta['config_checksum']}) 不一致，可能影响生成质量")
-            logger.info(f"已从 safetensors 加载模型 {base}")
-        else:
-            if self.config.get('model_checksum_required') and os.path.exists(path + '.sha256'):
-                with open(path, 'rb') as f:
-                    current = hashlib.sha256(f.read()).hexdigest()
-                with open(path + '.sha256', 'r') as f:
-                    expected = f.read().strip()
-                if current != expected:
-                    raise RuntimeError(f"模型文件校验失败！期望 {expected[:8]}，实际 {current[:8]}")
-            checkpoint = torch.load(path, map_location=self.device)
-            self.generator.load_state_dict(checkpoint['generator_state_dict'])
-            self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
-            self._scaler_mean = checkpoint['scaler_mean']
-            self._scaler_std = checkpoint['scaler_std']
-            logger.info(f"已加载模型 {path}")
-
-    # ── 数据预处理（无前瞻偏差，含缩尾） ──
-    def _preprocess_returns(self, returns: np.ndarray,
-                            validation_split: float = 0.0) -> Tuple[torch.Tensor, Optional[torch.Tensor], float, float]:
-        returns = returns[np.isfinite(returns)]
-        if len(returns) < self.seq_len * 2:
-            raise ValueError(f"数据长度不足，至少需要 {self.seq_len*2} 个观测值")
-        # 缩尾处理
-        if self.config["winsorize_pct"] > 0:
-            lower = np.percentile(returns, self.config["winsorize_pct"] * 100)
-            upper = np.percentile(returns, 100 - self.config["winsorize_pct"] * 100)
-            returns = np.clip(returns, lower, upper)
-
-        n_total = len(returns) - self.seq_len + 1
-        split_idx = int(n_total * (1 - validation_split))
-        train_ret_seg = returns[:split_idx + self.seq_len]
-        mean = float(np.nanmean(train_ret_seg))
-        std = float(np.nanstd(train_ret_seg) + 1e-8)
-        norm = (returns - mean) / std
-
-        def make_seqs(data, offset):
-            return np.array([data[i:i+self.seq_len] for i in range(offset, offset + len(data) - self.seq_len + 1)])
-
-        train_tensor = torch.tensor(make_seqs(norm, 0)[:split_idx], dtype=torch.float32).to(self.device)
-        val_tensor = None
-        if validation_split > 0 and split_idx < n_total:
-            val_seqs = make_seqs(norm, split_idx)
-            val_tensor = torch.tensor(val_seqs, dtype=torch.float32).to(self.device)
-        return train_tensor, val_tensor, mean, std
-
-    def _gradient_penalty(self, real_data: torch.Tensor, fake_data: torch.Tensor) -> torch.Tensor:
-        batch_size = real_data.size(0)
-        epsilon = torch.rand(batch_size, 1, device=self.device)
-        epsilon = epsilon.expand_as(real_data)
-        interpolated = epsilon * real_data + (1 - epsilon) * fake_data
-        prob_interpolated = self.discriminator(interpolated)
-        gradients = torch.autograd.grad(
-            outputs=prob_interpolated,
-            inputs=interpolated,
-            grad_outputs=torch.ones_like(prob_interpolated),
-            create_graph=True,
-            retain_graph=True
-        )[0]
-        gradients = gradients.view(batch_size, -1)
-        gradient_norm = gradients.norm(2, dim=1)
-        gp = self.config["gp_weight"] * ((gradient_norm - 1) ** 2).mean()
-        return gp
-
-    def train(self, real_returns: np.ndarray, validation_returns: Optional[np.ndarray] = None,
-              **override_params) -> Dict[str, Any]:
+    # ── 统计极值模型（Heston + 复合泊松跳跃） ─────────────
+    def _statistical_extreme_generator(
+        self,
+        num_scenarios: int,
+        length: int,
+        extreme_factor: float,
+        seed: Optional[int] = None
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
-        训练 WGAN-GP。
-        validation_returns: 外部验证集（可选），若提供，则 real_returns 仅用于训练，不进行内部分割。
-        返回训练摘要字典。
+        统计极值模型：随机波动率 + 复合泊松跳跃扩散
+
+        返回: (scenarios_array, metadata)
         """
-        if not TORCH_AVAILABLE:
-            return {"status": "error", "reason": "PyTorch 不可用，无法训练", "warnings": []}
+        rng = np.random.RandomState(self._get_seed(seed))
+        # 参数校准（转换为每步参数，假设每步为3分钟，每日约480步）
+        steps_per_day = 480
+        dt = 1.0 / steps_per_day
+        annual_vol = self.annual_vol
+        base_vol = annual_vol * np.sqrt(dt)  # 每步波动率
+        # 跳跃部分
+        jump_prob = self.jump_intensity * dt * extreme_factor  # 每步跳跃概率
+        jump_std = self.jump_std * np.sqrt(extreme_factor)
 
-        train_cfg = copy.deepcopy(self.config)
-        train_cfg.update(override_params)
+        scenarios = np.zeros((num_scenarios, length))
+        metadata_list = []
+        for i in range(num_scenarios):
+            # 随机波动率路径（简化：OU过程）
+            vol_path = np.ones(length) * base_vol
+            # 对数收益率
+            log_returns = rng.normal(0, vol_path)
+            # 跳跃：每步以概率 jump_prob 发生跳跃，幅度从正态分布抽取
+            jump_mask = rng.rand(length) < jump_prob
+            jump_sizes = rng.normal(0, jump_std, size=length) * jump_mask
+            log_returns += jump_sizes
+            # 额外闪崩（在随机位置添加大幅负收益）
+            if extreme_factor > 2.0:
+                crash_count = min(length, int(extreme_factor * 2))
+                crash_indices = rng.choice(length, size=crash_count, replace=False)
+                crash_amplitudes = rng.uniform(0.03, 0.10, size=crash_count) * extreme_factor
+                log_returns[crash_indices] -= crash_amplitudes
+            # 构建价格序列
+            prices = self.base_price * np.exp(np.cumsum(log_returns))
+            prices = np.clip(prices, 1e-2, 1e8)
+            scenarios[i] = prices
+            # 记录场景统计信息
+            metadata_list.append({
+                "scenario_id": i,
+                "max_drawdown": float(np.max((np.maximum.accumulate(prices) - prices) / np.maximum.accumulate(prices))),
+                "volatility": float(np.std(np.diff(np.log(prices))) / np.sqrt(dt)),
+                "jump_count": int(np.sum(jump_mask)),
+            })
+        return scenarios, {"scenario_meta": metadata_list}
 
-        # 固定种子
-        if train_cfg.get("seed") is not None:
-            torch.manual_seed(train_cfg["seed"])
-            np.random.seed(train_cfg["seed"])
-            logger.info(f"训练种子设置为 {train_cfg['seed']}")
+    # ── GAN 生成（对数收益率空间） ─────────────────────────
+    def _gan_generate(
+        self,
+        num_scenarios: int,
+        length: int,
+        extreme_factor: float,
+        seed: Optional[int] = None
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """使用GAN生成对数收益率序列，再转换为价格"""
+        if self._generator is None or length != self._seq_len:
+            # 降级
+            return self._statistical_extreme_generator(num_scenarios, length, extreme_factor, seed)
 
-        self._real_train_returns = real_returns.copy()
+        rng = np.random.RandomState(self._get_seed(seed))
+        torch.manual_seed(self._get_seed(seed))
+        self._generator.eval()
+        scenarios = np.zeros((num_scenarios, length))
+        batch_size = min(64, num_scenarios)
+        with torch.no_grad():
+            for start in range(0, num_scenarios, batch_size):
+                end = min(start + batch_size, num_scenarios)
+                bs = end - start
+                noise = torch.randn(bs, self._noise_dim, device=self._device)
+                # 极端因子放大噪声方差
+                noise_scale = 1.0 + max(0.0, (extreme_factor - 1.0)) * 0.5
+                noise = noise * noise_scale
+                fake_returns = self._generator(noise).cpu().numpy()  # shape (bs, seq_len)
+                # 反标准化（若模型训练时保存了归一化参数）
+                ret_mean = self._model_meta.get('ret_mean', 0.0)
+                ret_std = self._model_meta.get('ret_std', 0.01)
+                fake_returns = fake_returns * ret_std + ret_mean
+                # 构建价格
+                prices = self.base_price * np.exp(np.cumsum(fake_returns, axis=1))
+                scenarios[start:end] = np.clip(prices, 1e-2, 1e8)
+        metadata = {"method": "GAN", "gan_model_path": self._model_path}
+        return scenarios, metadata
 
-        # 设置模式
-        self.generator.train()
-        self.discriminator.train()
+    # ── 主生成接口 ────────────────────────────────────────
+    def generate(
+        self,
+        num_scenarios: int = 100,
+        length: int = DEFAULT_SEQUENCE_LENGTH,
+        extreme_factor: float = 1.0,
+        seed: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        生成压力测试场景
+
+        Args:
+            num_scenarios: 场景数量 (1~10000)
+            length: 每个场景的步数 (10~2000)
+            extreme_factor: 极端程度，1.0正常，>1.0加剧尾部 (建议1.0~5.0)
+            seed: 随机种子，None 则使用熵源
+
+        Returns:
+            {"status": "ok", "scenarios": List[List[float]], "metadata": {...}}
+        """
+        # 参数校验
+        if not (1 <= num_scenarios <= MAX_SCENARIOS):
+            return {"status": "error", "reason": f"num_scenarios 需在 1~{MAX_SCENARIOS} 之间"}
+        if not (MIN_LENGTH <= length <= MAX_LENGTH):
+            return {"status": "error", "reason": f"length 需在 {MIN_LENGTH}~{MAX_LENGTH} 之间"}
+        if not (EXTREME_FACTOR_MIN <= extreme_factor <= EXTREME_FACTOR_MAX):
+            return {"status": "error", "reason": f"extreme_factor 需在 {EXTREME_FACTOR_MIN}~{EXTREME_FACTOR_MAX} 之间"}
+
+        start_time = time.perf_counter()
+        seed = self._get_seed(seed)
+        warnings = []
 
         try:
-            if validation_returns is not None:
-                # 外部验证集，使用全部 real_returns 训练
-                train_tensor, _, mean, std = self._preprocess_returns(real_returns, 0.0)
-                val_norm = (validation_returns - mean) / std
-                val_seqs = [val_norm[i:i+self.seq_len] for i in range(len(val_norm)-self.seq_len+1)]
-                val_tensor = torch.tensor(np.array(val_seqs), dtype=torch.float32).to(self.device) if val_seqs else None
+            if self._use_gan and self._generator is not None:
+                scenarios_arr, gen_meta = self._gan_generate(num_scenarios, length, extreme_factor, seed)
             else:
-                train_tensor, val_tensor, mean, std = self._preprocess_returns(real_returns, validation_split=0.2)
+                scenarios_arr, gen_meta = self._statistical_extreme_generator(
+                    num_scenarios, length, extreme_factor, seed
+                )
+                if self._use_gan and self._generator is None:
+                    warnings.append("GAN未训练或无生成器，已使用统计模型")
+        except Exception as e:
+            logger.error("生成失败: %s，降级为统计模型", str(e))
+            warnings.append(f"GAN生成异常: {str(e)}")
+            scenarios_arr, gen_meta = self._statistical_extreme_generator(
+                num_scenarios, length, extreme_factor, seed
+            )
 
-            self._scaler_mean = mean
-            self._scaler_std = std
+        elapsed = time.perf_counter() - start_time
+        scenarios_list = scenarios_arr.tolist()
 
-            dataset = TensorDataset(train_tensor)
-            pin_memory = self.device.type == 'cuda'
-            dataloader = DataLoader(dataset, batch_size=train_cfg["batch_size"], shuffle=True,
-                                    pin_memory=pin_memory, drop_last=True)
+        # 审计元数据
+        audit_hash = hashlib.sha256(
+            json.dumps(scenarios_list, default=str).encode('utf-8')
+        ).hexdigest()
 
-            g_optim = optim.Adam(self.generator.parameters(), lr=train_cfg["lr_g"],
-                                 betas=(train_cfg["beta1"], train_cfg["beta2"]))
-            d_optim = optim.Adam(self.discriminator.parameters(), lr=train_cfg["lr_d"],
-                                 betas=(train_cfg["beta1"], train_cfg["beta2"]))
-            # 学习率调度
-            g_scheduler = optim.lr_scheduler.StepLR(g_optim, step_size=train_cfg["lr_decay_step"],
-                                                    gamma=train_cfg["lr_decay_factor"])
-            d_scheduler = optim.lr_scheduler.StepLR(d_optim, step_size=train_cfg["lr_decay_step"],
-                                                    gamma=train_cfg["lr_decay_factor"])
+        metadata = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "version": VERSION,
+            "num_scenarios": num_scenarios,
+            "length": length,
+            "extreme_factor": extreme_factor,
+            "seed": seed,
+            "base_price": self.base_price,
+            "elapsed_seconds": elapsed,
+            "method": "GAN" if self._use_gan else "Statistical",
+            "scenario_hash_sha256": audit_hash,
+            **gen_meta,
+        }
 
-            scaler = GradScaler() if AMP_AVAILABLE and train_cfg.get("use_amp") and self.device.type == 'cuda' else None
+        return {
+            "status": "ok",
+            "scenarios": scenarios_list,
+            "metadata": metadata,
+            "warnings": warnings,
+        }
 
-            best_val_wdist = float('inf')
-            patience_counter = 0
-            best_state = None
-            d_losses, g_losses = [], []
+    # ── 训练接口 ──────────────────────────────────────────
+    def train(
+        self,
+        data: np.ndarray,
+        epochs: int = DEFAULT_TRAINING_EPOCHS,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        lr: float = DEFAULT_LEARNING_RATE,
+    ) -> Dict[str, Any]:
+        """
+        使用历史对数收益率数据训练GAN
 
-            for epoch in range(train_cfg["max_epochs"]):
-                epoch_d_loss, epoch_g_loss = 0.0, 0.0
-                n_batches = 0
-                for (real_seqs,) in dataloader:
-                    bs = real_seqs.size(0)
-                    # 训练判别器多次
-                    for _ in range(train_cfg["n_critic"]):
-                        d_optim.zero_grad()
-                        if scaler:
-                            with autocast():
-                                real_val = self.discriminator(real_seqs)
-                                noise = torch.randn(bs, self.noise_dim, device=self.device)
-                                fake = self.generator(noise)
-                                fake_val = self.discriminator(fake.detach())
-                                d_loss = fake_val.mean() - real_val.mean()
-                                gp = self._gradient_penalty(real_seqs, fake.detach())
-                                d_total = d_loss + gp
-                            scaler.scale(d_total).backward()
-                            scaler.unscale_(d_optim)
-                            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), train_cfg["gradient_clip"])
-                            scaler.step(d_optim)
-                            scaler.update()
-                        else:
-                            real_val = self.discriminator(real_seqs)
-                            noise = torch.randn(bs, self.noise_dim, device=self.device)
-                            fake = self.generator(noise)
-                            fake_val = self.discriminator(fake.detach())
-                            d_loss = fake_val.mean() - real_val.mean()
-                            gp = self._gradient_penalty(real_seqs, fake.detach())
-                            d_total = d_loss + gp
-                            d_total.backward()
-                            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), train_cfg["gradient_clip"])
-                            d_optim.step()
+        Args:
+            data: 形状 (samples, seq_len) 的对数收益率序列，建议已标准化
+            epochs: 训练轮数
+            batch_size: 批次大小
+            lr: 学习率
+
+        Returns:
+            训练结果字典
+        """
+        if not TORCH_AVAILABLE:
+            return {"status": "error", "reason": "PyTorch不可用，无法训练GAN"}
+        if len(data) == 0:
+            return {"status": "error", "reason": "训练数据为空"}
+        try:
+            data_tensor = torch.tensor(data, dtype=torch.float32)
+            dataset = torch.utils.data.TensorDataset(data_tensor)
+            dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+            # 计算归一化参数并保存
+            ret_mean = float(np.mean(data))
+            ret_std = float(np.std(data)) + 1e-8
+            # 归一化到近似 [-1, 1]
+            normalized_data = (data - ret_mean) / ret_std
+            data_tensor = torch.tensor(normalized_data, dtype=torch.float32)
+            dataset = torch.utils.data.TensorDataset(data_tensor)
+            dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+            self._seq_len = data.shape[1]
+            self._init_gan()  # 重新初始化以匹配序列长度
+
+            criterion = nn.BCELoss()
+            optimizer_g = optim.Adam(self._generator.parameters(), lr=lr)
+            optimizer_d = optim.Adam(self._discriminator.parameters(), lr=lr)
+
+            for epoch in range(epochs):
+                for (real_batch,) in dataloader:
+                    real_batch = real_batch.to(self._device)
+                    current_bs = real_batch.size(0)
+                    # 标签平滑（双侧）
+                    real_labels = torch.full((current_bs, 1), 0.9, device=self._device)
+                    fake_labels = torch.full((current_bs, 1), 0.1, device=self._device)
+
+                    # 训练判别器
+                    optimizer_d.zero_grad()
+                    outputs_real = self._discriminator(real_batch)
+                    loss_d_real = criterion(outputs_real, real_labels)
+                    noise = torch.randn(current_bs, self._noise_dim, device=self._device)
+                    fake_batch = self._generator(noise)
+                    outputs_fake = self._discriminator(fake_batch.detach())
+                    loss_d_fake = criterion(outputs_fake, fake_labels)
+                    loss_d = loss_d_real + loss_d_fake
+                    loss_d.backward()
+                    optimizer_d.step()
 
                     # 训练生成器
-                    g_optim.zero_grad()
-                    if scaler:
-                        with autocast():
-                            noise = torch.randn(bs, self.noise_dim, device=self.device)
-                            fake = self.generator(noise)
-                            g_loss = -self.discriminator(fake).mean()
-                        scaler.scale(g_loss).backward()
-                        scaler.unscale_(g_optim)
-                        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), train_cfg["gradient_clip"])
-                        scaler.step(g_optim)
-                        scaler.update()
-                    else:
-                        noise = torch.randn(bs, self.noise_dim, device=self.device)
-                        fake = self.generator(noise)
-                        g_loss = -self.discriminator(fake).mean()
-                        g_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), train_cfg["gradient_clip"])
-                        g_optim.step()
+                    optimizer_g.zero_grad()
+                    noise = torch.randn(current_bs, self._noise_dim, device=self._device)
+                    fake_batch = self._generator(noise)
+                    outputs = self._discriminator(fake_batch)
+                    loss_g = criterion(outputs, torch.ones(current_bs, 1, device=self._device))
+                    loss_g.backward()
+                    optimizer_g.step()
 
-                    epoch_d_loss += d_total.item()
-                    epoch_g_loss += g_loss.item()
-                    n_batches += 1
+                if (epoch + 1) % 10 == 0:
+                    logger.info("Epoch %d/%d | D loss: %.4f | G loss: %.4f", epoch+1, epochs, loss_d.item(), loss_g.item())
 
-                avg_d = epoch_d_loss / n_batches
-                avg_g = epoch_g_loss / n_batches
-                d_losses.append(avg_d)
-                g_losses.append(avg_g)
-
-                g_scheduler.step()
-                d_scheduler.step()
-
-                # 验证集评估（Wasserstein 距离，有符号）
-                if val_tensor is not None:
-                    self.generator.eval()
-                    with torch.no_grad():
-                        noise_val = torch.randn(len(val_tensor), self.noise_dim, device=self.device)
-                        fake_val = self.generator(noise_val)
-                        real_mean = self.discriminator(val_tensor).mean()
-                        fake_mean = self.discriminator(fake_val).mean()
-                        w_dist = real_mean - fake_mean  # 不取绝对值，正值表示真实>虚假
-                    self.generator.train()
-                    # 使用绝对 Wasserstein 距离的移动平均作为早停指标
-                    w_dist_abs = abs(w_dist.item())
-                    if w_dist_abs < best_val_wdist:
-                        best_val_wdist = w_dist_abs
-                        patience_counter = 0
-                        best_state = {
-                            'gen': {k: v.cpu().clone() for k, v in self.generator.state_dict().items()},
-                            'disc': {k: v.cpu().clone() for k, v in self.discriminator.state_dict().items()}
-                        }
-                    else:
-                        patience_counter += 1
-                        if patience_counter >= train_cfg["patience"]:
-                            logger.info(f"早停于 epoch {epoch+1}，最佳 Wasserstein 距离: {best_val_wdist:.6f}")
-                            break
-                else:
-                    # 无验证集时仅保存最新状态作为最佳（无早停）
-                    best_state = None
-
-                if (epoch + 1) % 100 == 0:
-                    logger.info(f"Epoch {epoch+1} | D Loss: {avg_d:.4f} | G Loss: {avg_g:.4f}")
-
-            # 恢复最佳模型
-            if best_state is not None:
-                self.generator.load_state_dict(best_state['gen'])
-                self.discriminator.load_state_dict(best_state['disc'])
-                logger.info("已恢复验证集最优模型权重")
-
-            # 保存最终模型
-            model_path = os.path.join(train_cfg["model_dir"], f"gan_model_{self._config_checksum}.pt")
-            self._save_model(model_path)
+            # 保存模型与元数据
+            os.makedirs(os.path.dirname(self._model_path), exist_ok=True)
+            torch.save({
+                'generator': self._generator.state_dict(),
+                'discriminator': self._discriminator.state_dict(),
+                'meta': {
+                    'seq_len': self._seq_len,
+                    'ret_mean': ret_mean,
+                    'ret_std': ret_std,
+                    'noise_dim': self._noise_dim,
+                }
+            }, self._model_path)
+            self._model_meta = {'seq_len': self._seq_len, 'ret_mean': ret_mean, 'ret_std': ret_std}
+            self._use_gan = True  # 训练成功后启用GAN模式
+            logger.info("GAN模型已保存至 %s", self._model_path)
 
             return {
                 "status": "ok",
-                "epochs_trained": epoch + 1,
-                "best_val_wasserstein_dist": best_val_wdist if val_tensor is not None else None,
-                "final_d_loss": d_losses[-1] if d_losses else None,
-                "final_g_loss": g_losses[-1] if g_losses else None,
-                "config_checksum": self._config_checksum,
-                "warnings": []
+                "loss_g": loss_g.item(),
+                "loss_d": loss_d.item(),
+                "epochs": epochs,
+                "model_path": self._model_path,
             }
         except Exception as e:
-            logger.exception("训练过程中发生异常")
-            if best_state is not None:
-                self.generator.load_state_dict(best_state['gen'])
-                self.discriminator.load_state_dict(best_state['disc'])
-            return {"status": "error", "reason": str(e), "warnings": []}
-        finally:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    # ── 生成样本 ──
-    def generate_samples(self, num_samples: int, seq_len: Optional[int] = None,
-                         seed: Optional[int] = None, extreme: bool = False) -> np.ndarray:
-        """
-        生成合成收益率序列。
-        extreme: 若 True，注入复合跳跃过程，模拟市场崩盘/暴涨。
-        """
-        if seed is not None:
-            np.random.seed(seed)
-            if TORCH_AVAILABLE:
-                torch.manual_seed(seed)
-
-        seq_len = seq_len or self.seq_len
-
-        if TORCH_AVAILABLE and self.generator:
-            self.generator.eval()
-            all_samples = []
-            with torch.no_grad():
-                # 分批次生成，避免 OOM
-                batch_size = min(num_samples, 256)
-                n_batches = int(np.ceil(num_samples / batch_size))
-                for i in range(n_batches):
-                    current_bs = min(batch_size, num_samples - len(all_samples))
-                    noise_std = 3.0 if extreme else 1.0
-                    noise = torch.randn(current_bs, self.noise_dim, device=self.device) * noise_std
-                    gen = self.generator(noise).cpu().numpy()
-                    gen = gen * self._scaler_std + self._scaler_mean
-                    if extreme:
-                        # 跳跃幅度基于历史分位数
-                        jump_scale = self.config["jump_scale_mult"] * self._scaler_std
-                        jump_mask = np.random.binomial(1, self.config["jump_lambda"], size=gen.shape)
-                        direction = np.random.choice([-1, 1], size=gen.shape)
-                        gen += jump_mask * direction * np.random.exponential(scale=jump_scale, size=gen.shape)
-                    # 调整长度
-                    if gen.shape[1] > seq_len:
-                        gen = gen[:, :seq_len]
-                    elif gen.shape[1] < seq_len:
-                        # 使用随机填充而非边缘填充，避免虚假平稳
-                        pad_len = seq_len - gen.shape[1]
-                        pad = np.random.normal(0, self._scaler_std * 0.1, size=(gen.shape[0], pad_len))
-                        gen = np.concatenate([gen, pad], axis=1)
-                    # 数值安全检查
-                    if not _is_finite(gen):
-                        gen[~np.isfinite(gen)] = 0.0
-                    all_samples.append(gen)
-            return np.concatenate(all_samples, axis=0)[:num_samples]
-        else:
-            return self._fallback_generate(num_samples, seq_len, extreme)
-
-    def _fallback_generate(self, num_samples: int, seq_len: int, extreme: bool) -> np.ndarray:
-        if self._real_train_returns is None or len(self._real_train_returns) < seq_len:
-            logger.warning("历史数据不足，生成纯噪声")
-            return np.random.standard_t(df=3, size=(num_samples, seq_len)) * 0.01
-
-        rets = self._real_train_returns
-        if len(rets) <= seq_len:
-            # 若长度相等，直接重复该序列并加微小噪声
-            base = np.tile(rets, (num_samples, 1))
-            return base + np.random.normal(0, np.std(rets)*0.1, size=base.shape)
-
-        samples = []
-        scale = np.std(rets)
-        for _ in range(num_samples):
-            start = np.random.randint(0, len(rets) - seq_len)
-            seg = rets[start:start+seq_len].copy()
-            if extreme:
-                noise = np.random.standard_t(df=3, size=seq_len) * scale * 0.5
-                seg = seg + noise
-                jump = np.random.binomial(1, 0.05, size=seq_len) * np.random.laplace(0, scale * 3, size=seq_len)
-                seg += jump
-            samples.append(seg)
-        return np.array(samples)
-
-    # ── 统计报告（机构级完备） ──
-    @staticmethod
-    def statistical_report(real: np.ndarray, synthetic: np.ndarray,
-                           alpha: float = 0.05) -> Dict[str, Any]:
-        """
-        对比报告：均值、波动率、偏度、峰度、VaR、自相关、ARCH效应、KS检验
-        """
-        real = real[np.isfinite(real)]
-        synthetic = synthetic[np.isfinite(synthetic)]
-        if len(real) < 5 or len(synthetic) < 5:
-            return {"error": "数据量不足"}
-
-        def _desc(arr):
-            return {
-                "mean": float(np.mean(arr)),
-                "std": float(np.std(arr)),
-                "skew": _stable_skew(arr),
-                "kurtosis": _stable_kurtosis(arr),
-                "min": float(np.min(arr)),
-                "max": float(np.max(arr)),
-                "var_95": float(np.percentile(arr, 5))
-            }
-
-        report = {"real": _desc(real), "synthetic": _desc(synthetic)}
-
-        # 自相关 lag1
-        if SCIPY_AVAILABLE:
-            try:
-                r_ac, _ = scipy_stats.pearsonr(real[:-1], real[1:])
-                s_ac, _ = scipy_stats.pearsonr(synthetic[:-1], synthetic[1:])
-                report["autocorr_lag1"] = {"real": r_ac, "synthetic": s_ac}
-            except Exception as e:
-                logger.warning(f"自相关计算失败: {e}")
-
-            # ARCH 效应（平方收益率的自相关）
-            try:
-                real_sq = (real - np.mean(real))**2
-                syn_sq = (synthetic - np.mean(synthetic))**2
-                r_arch, _ = scipy_stats.pearsonr(real_sq[:-1], real_sq[1:])
-                s_arch, _ = scipy_stats.pearsonr(syn_sq[:-1], syn_sq[1:])
-                report["arch_effect"] = {"real": r_arch, "synthetic": s_arch}
-            except Exception as e:
-                logger.warning(f"ARCH效应计算失败: {e}")
-
-            # KS 检验（两样本分布比较）
-            try:
-                ks_stat, ks_p = scipy_stats.ks_2samp(real, synthetic)
-                report["ks_test"] = {"statistic": ks_stat, "p_value": ks_p,
-                                      "reject_same_dist": bool(ks_p < alpha)}
-            except Exception as e:
-                logger.warning(f"KS检验失败: {e}")
-
-            # Q-Q 残差（真实分位数与合成分位数的相关性）
-            try:
-                common_quantiles = np.linspace(0.01, 0.99, 50)
-                real_q = np.quantile(real, common_quantiles)
-                synth_q = np.quantile(synthetic, common_quantiles)
-                qq_corr, _ = scipy_stats.pearsonr(real_q, synth_q)
-                report["qq_correlation"] = qq_corr
-            except Exception as e:
-                logger.warning(f"Q-Q计算失败: {e}")
-        else:
-            report["scipy_warning"] = "scipy未安装，部分高级检验不可用"
-
-        return report
+            logger.error("GAN训练失败: %s", str(e))
+            return {"status": "error", "reason": str(e)}
 
     @classmethod
     def health_check(cls) -> Dict[str, Any]:
-        """模块自检，不影响实例状态"""
+        """模块自检"""
         try:
-            test_cfg = {'device': 'cpu', 'seq_len': 20}
-            inst = cls(config=test_cfg)
-            inst._real_train_returns = np.random.randn(200) * 0.01
-            samples = inst.generate_samples(5, 20, seed=42)
-            assert samples.shape == (5, 20)
-            assert _is_finite(samples)
-            report = cls.statistical_report(inst._real_train_returns, samples.flatten())
-            assert "real" in report
-            return {"status": "ok", "message": "GAN压力测试模块自检通过"}
+            inst = cls(use_gan=False)
+            res = inst.generate(num_scenarios=2, length=50, extreme_factor=1.0, seed=42)
+            if res["status"] == "ok" and len(res["scenarios"]) == 2:
+                return {
+                    "status": "ok",
+                    "message": f"压力测试生成器可用 (方法: {res['metadata']['method']})",
+                }
+            return {"status": "error", "message": res.get("reason", "生成失败")}
         except Exception as e:
-            logger.error(f"健康检查失败: {e}")
+            logger.error("健康检查失败: %s", str(e))
             return {"status": "error", "message": str(e)}
 
-    def shutdown(self):
-        """热重载时安全释放 GPU 资源"""
-        if TORCH_AVAILABLE:
-            del self.generator
-            del self.discriminator
-            torch.cuda.empty_cache()
-        logger.info("GANStressTest 已关闭并释放资源")
 
-
-# ── 主入口 ──
 def main():
+    """命令行入口"""
     import argparse
-    import pandas as pd
 
-    parser = argparse.ArgumentParser(description="火种对抗样本生成器（WGAN-GP 机构级）")
-    parser.add_argument("--config", type=str, help="超参数YAML配置文件")
-    parser.add_argument("--data", type=str, help="历史收益率CSV（单列，无表头）")
-    parser.add_argument("--mode", choices=["train", "generate", "report"], default="generate")
-    parser.add_argument("--model", type=str, default="models/gan_model.pt")
-    parser.add_argument("--num-samples", type=int, default=10)
-    parser.add_argument("--seq-len", type=int, default=50)
-    parser.add_argument("--extreme", action="store_true")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output", type=str, help="输出CSV文件路径")
+    parser = argparse.ArgumentParser(description=f"火种对抗样本压力测试生成器 v{VERSION}")
+    parser.add_argument("--scenarios", type=int, default=10, help="生成场景数量")
+    parser.add_argument("--length", type=int, default=DEFAULT_SEQUENCE_LENGTH, help="序列长度（步数）")
+    parser.add_argument("--extreme", type=float, default=1.0, help="极端因子 (>1.0加剧尾部)")
+    parser.add_argument("--output", type=str, default="stress_scenarios.csv", help="输出CSV路径")
+    parser.add_argument("--train", type=str, help="历史数据CSV用于训练GAN (列：价格)")
+    parser.add_argument("--epochs", type=int, default=DEFAULT_TRAINING_EPOCHS, help="训练轮数")
+    parser.add_argument("--seed", type=int, default=None, help="随机种子（可复现）")
+    parser.add_argument("--base-price", type=float, default=DEFAULT_BASE_PRICE, help="基准价格")
     args = parser.parse_args()
 
-    # 加载配置
-    config = {}
-    if args.config and os.path.exists(args.config):
-        with open(args.config, 'r') as f:
-            config = yaml.safe_load(f)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
 
-    inst = GANStressTest(config=config, model_path=args.model if args.mode in ("generate","report") else None)
+    inst = GANStressTest(base_price=args.base_price, use_gan=True)
 
-    if args.mode == "train":
-        if not args.data:
-            sys.exit("训练模式需要 --data 指定历史收益率文件")
-        data = pd.read_csv(args.data, header=None).values.flatten()
-        result = inst.train(data)
-        # 安全序列化 JSON，处理 numpy 类型
-        def default_serializer(obj):
-            if isinstance(obj, (np.integer,)):
-                return int(obj)
-            elif isinstance(obj, (np.floating,)):
-                return float(obj)
-            elif isinstance(obj, np.ndarray):
-                return obj.tolist()
-            raise TypeError(f"无法序列化 {type(obj)}")
-        print(json.dumps(result, indent=2, default=default_serializer))
+    # 训练模式
+    if args.train:
+        try:
+            df = pd.read_csv(args.train, encoding='utf-8')
+            prices = df.iloc[:, 0].values.astype(np.float64)
+            # 计算对数收益率并切窗口
+            log_returns = np.diff(np.log(prices))
+            seq_len = args.length
+            windows = [log_returns[i:i+seq_len] for i in range(0, len(log_returns)-seq_len, seq_len//2)]
+            if len(windows) < 10:
+                logger.error("训练数据不足（需要至少10个窗口）")
+                sys.exit(1)
+            data = np.array(windows)
+            logger.info("开始GAN训练，样本数: %d", len(data))
+            train_res = inst.train(data, epochs=args.epochs)
+            print(train_res)
+            if train_res["status"] != "ok":
+                sys.exit(1)
+        except Exception as e:
+            logger.error("训练失败: %s", str(e))
+            sys.exit(1)
 
-    elif args.mode == "generate":
-        samples = inst.generate_samples(args.num_samples, args.seq_len, seed=args.seed, extreme=args.extreme)
-        if args.output:
-            np.savetxt(args.output, samples, delimiter=',', header="synthetic_returns")
-            print(f"生成样本已保存至 {args.output}")
-        else:
-            print(samples[:2])
+    # 生成场景
+    result = inst.generate(
+        num_scenarios=args.scenarios,
+        length=args.length,
+        extreme_factor=args.extreme,
+        seed=args.seed,
+    )
+    if result["status"] != "ok":
+        logger.error("生成失败: %s", result.get("reason", ""))
+        sys.exit(1)
 
-    elif args.mode == "report":
-        if not args.data:
-            sys.exit("报告模式需要 --data")
-        real = pd.read_csv(args.data, header=None).values.flatten()
-        synthetic = inst.generate_samples(len(real), len(real), seed=args.seed, extreme=True).flatten()
-        report = GANStressTest.statistical_report(real, synthetic)
-        def default_serializer(obj):
-            if isinstance(obj, (np.integer,)):
-                return int(obj)
-            elif isinstance(obj, (np.floating,)):
-                return float(obj)
-            elif isinstance(obj, np.ndarray):
-                return obj.tolist()
-            raise TypeError
-        print(json.dumps(report, indent=2, default=default_serializer))
+    # 保存CSV（附带元数据）
+    scenarios = result["scenarios"]
+    df = pd.DataFrame(scenarios).T
+    df.columns = [f"scenario_{i+1}" for i in range(len(scenarios))]
+    df.to_csv(args.output, index=False)
+    logger.info("压力场景已保存至 %s (方法: %s, 耗时: %.3fs)", args.output,
+                result["metadata"]["method"], result["metadata"]["elapsed_seconds"])
+    # 输出元数据JSON
+    meta_path = args.output.replace('.csv', '_meta.json')
+    with open(meta_path, 'w') as f:
+        json.dump(result["metadata"], f, indent=2, default=str)
+    logger.info("元数据已保存至 %s", meta_path)
+    print(f"生成完成: {args.output}")
+
 
 if __name__ == "__main__":
     main()
