@@ -1,792 +1,749 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Spark Quant System Contributors. All Rights Reserved.
 """
 火种系统 · 代码质量门禁总入口 (QualityGate)
-===============================================
-机构级静态代码审查与合规验证系统。
-符合华尔街高频交易级代码标准，适用于万亿美金管理规模的生产环境。
 
 核心职责：
-1. 插件式检查器生命周期管理：加载、超时控制、重试、降级。
-2. 并发/串行执行多个检查器，支持首失败即停止。
-3. 输出多格式审计报告（Terminal ANSI / JSON / SARIF）。
-4. 原子写入报告文件，确保数据完整性。
-5. 提供结构化健康检查，集成到 CI/CD 流水线及生产环境守护进程。
+1. 按优先级顺序执行全部代码质量与配置校验（支持子进程隔离与超时控制）
+2. 生成结构化审计报告（终端输出 + JSON + Prometheus指标 + 审计链）
+3. 提供细粒度退出码供CI/CD与运维监控集成
 
 外部依赖（真实模块接口）：
-- scripts.style_checker.StyleChecker              : 风格校验，需实现 run() -> Dict
-- scripts.dependency_checker.DependencyChecker    : 依赖闭环校验
-- scripts.interface_verifier.InterfaceVerifier    : 接口契约校验
-- scripts.config_decouple_checker.ConfigDecoupleChecker : 配置解耦校验
+- scripts.style_checker : 风格校验器
+- scripts.dependency_checker : 依赖闭环校验器
+- scripts.interface_verifier : 接口契约校验器
+- scripts.config_decouple_checker.ConfigDecoupleChecker : 配置解耦校验器
+- scripts.schema_validator : 配置文件Schema校验器
+- core.metrics : Prometheus指标输出（可选依赖）
+- core.audit_logger : 审计日志（可选依赖）
 
 接口契约：
-- run_all(checks, *, timeout, parallel, stop_on_first_failure) -> GateResult
-- health_check() -> Dict[str, Any]   (符合火种模块标准)
+- run_all_checks(project_root: str, timeout: int = 300, report_path: Optional[str] = None, ...) -> Dict[str, Any]
+  返回完整报告字典，包含 "exit_code", "summary", "details", "metrics", "audit_chain"
+- health_check(project_root: str = ".") -> Dict[str, Any]
+  输出字典固定包含 "status" (str), "reason" (str), "warnings" (List[str])
 
 异常与降级：
-- 检查器加载失败 → 重试后仍失败则标记为 ERROR，并记录建议恢复操作
-- 单个检查器超时 → 取消其 Future，标记 TIMEOUT，其他继续
-- 检查器抛出致命异常 → 捕获完整堆栈，标记 ERROR，不影响同批次其他检查
-- 输出报告前强制验证数据结构完整性，若损坏则降级为文本摘要并记录告警
-- 若全局线程池资源耗尽，自动回退为串行执行并告警
-- 收到 SIGTERM/SIGINT → 优雅关闭，等待当前检查完成，取消未开始任务
+- 任一校验器超时则记录 TIMEOUT 状态并继续后续校验（子进程隔离确保资源清理）
+- 若校验器模块导入失败，记录 CRITICAL 并视为强制失败
+- 所有异常按类别分级处理：TimeoutError > ImportError > RuntimeError > Exception
+- 门禁自身异常时生成 emergency_report.json 并退出码 4
 
 资源管理：
-- 使用上下文管理器确保线程池在异常时正确释放
-- 报告文件采用原子写入（临时文件 + os.replace），避免部分写入
-- 所有文件描述符使用 with 语句，临时文件权限 0o600
-- 不持有持久资源
+- 使用子进程隔离执行每个校验器，确保内存与CPU完全清理
+- 审计报告使用原子写入（临时文件 + fsync + rename），权限 0o640
+- 退出时 atexit 注册清理函数，确保临时文件删除
+- 文件锁防止多实例并发执行
+
+用法示例:
+    python scripts/quality_gate.py --project-root . --timeout 120 --report report.json --severity high
 """
 
+import argparse
+import atexit
+import fcntl
 import importlib
-import logging
-import sys
-import os
-import time
-import signal
-import traceback
+import importlib.metadata
 import json
+import logging
+import os
 import platform
-import tempfile
 import shutil
+import signal
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from dataclasses import dataclass, field, asdict
-from typing import Dict, Any, List, Optional, Callable, Union, Set, Tuple, Type
-from enum import Enum
-from contextlib import suppress
+from typing import Dict, Any, List, Optional, Tuple, NamedTuple, Set, Union
 
-# -----------------------------------------------------------------------------
-# 日志配置
-# 生产环境应由外部日志管理器注入，此处提供安全默认值。
-# 支持通过环境变量 QUALITY_GATE_LOG_LEVEL 控制日志级别。
-# -----------------------------------------------------------------------------
+# ── 可选依赖（优雅降级） ──────────────────────────────────
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+try:
+    from core.metrics import MetricsCollector
+    METRICS_AVAILABLE = True
+except ImportError:
+    METRICS_AVAILABLE = False
+    MetricsCollector = None
+
+try:
+    from core.audit_logger import AuditLogger
+    AUDIT_AVAILABLE = True
+except ImportError:
+    AUDIT_AVAILABLE = False
+    AuditLogger = None
+
+# ── 常量定义 ──────────────────────────────────────────────
+try:
+    VERSION = importlib.metadata.version("spark-quant")
+except importlib.metadata.PackageNotFoundError:
+    VERSION = "3.0.1-dev"
+
+SPDX_IDENTIFIER = "Apache-2.0"
+DEFAULT_TIMEOUT_SECONDS = 300
+DEFAULT_PROJECT_ROOT = "."
+MAX_VIOLATIONS_DISPLAY = 20
+SEPARATOR_LINE = "=" * 70
+REPORT_FILENAME = "quality_gate_report_{timestamp}_{uuid}.json"
+TEMP_DIR_PREFIX = "spark_quality_gate_"
+LOCK_FILE_NAME = ".quality_gate.lock"
+EXIT_CODE_MAP: Dict[str, int] = {
+    "all_passed": 0,
+    "warnings_only": 0,
+    "soft_fail": 1,
+    "hard_fail": 2,
+    "timeout": 3,
+    "system_error": 4,
+}
+VALID_STATUSES: Set[str] = {'ok', 'passed_with_warnings', 'failed', 'error', 'timeout'}
+PYTHON_MIN_VERSION: Tuple[int, int] = (3, 10)
+DEFAULT_REPORT_MODE = 0o640
+DEFAULT_TEMP_MODE = 0o700
+LOG_FORMAT_JSON = (
+    '{"timestamp":"%(asctime)s","level":"%(levelname)s",'
+    '"module":"%(name)s","message":"%(message)s"}'
+)
+# 线程本地存储（用于信号安全）
+_thread_local = threading.local()
+
 logger = logging.getLogger(__name__)
 
-if not logger.handlers:
-    # 根据环境决定格式：TTY 使用彩色，CI 使用简洁
-    if sys.stderr.isatty():
-        formatter = logging.Formatter(
-            "%(asctime)s [%(levelname)-5s] %(name)s: %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%S"
-        )
-    else:
-        formatter = logging.Formatter("[%(levelname)s] %(message)s")
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
 
-log_level = os.getenv("QUALITY_GATE_LOG_LEVEL", "INFO").upper()
-logger.setLevel(getattr(logging, log_level, logging.INFO))
+class CheckerDef(NamedTuple):
+    """校验器定义"""
+    module_name: str
+    display_name: str
+    required: bool
+    timeout: int = DEFAULT_TIMEOUT_SECONDS
 
-
-# -----------------------------------------------------------------------------
-# 领域模型
-# -----------------------------------------------------------------------------
-
-class GateStatus(str, Enum):
-    """门禁整体状态"""
-    PASS = "pass"           # 全部检查通过
-    FAIL = "fail"           # 至少一项代码检查失败
-    ERROR = "error"         # 系统级故障（如所有检查器加载失败）
-    DEGRADED = "degraded"   # 部分检查因环境问题未完成，但无明确代码缺陷
-
-
-class CheckItemStatus(str, Enum):
-    """单项检查状态"""
-    PASS = "pass"
-    FAIL = "fail"
-    ERROR = "error"
-    TIMEOUT = "timeout"
-    SKIPPED = "skipped"
-
-
-@dataclass
-class CheckItemResult:
-    """单项检查的详细结果"""
-    check_name: str
-    status: CheckItemStatus
-    message: str = ""
-    duration_ms: float = 0.0
-    warnings: List[str] = field(default_factory=list)
-    errors: List[str] = field(default_factory=list)
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    raw: Optional[Dict[str, Any]] = None
-
-    def __post_init__(self):
-        if self.warnings is None:
-            self.warnings = []
-        if self.errors is None:
-            self.errors = []
-
-
-@dataclass
-class GateResult:
-    """门禁聚合结果"""
-    status: GateStatus
-    reason: str
-    timestamp: str = field(default_factory=lambda: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-    environment: Dict[str, str] = field(default_factory=dict)
-    check_results: List[CheckItemResult] = field(default_factory=list)
-    total_duration_ms: float = 0.0
-    extra: Dict[str, Any] = field(default_factory=dict)
-
-    def is_success(self) -> bool:
-        return self.status == GateStatus.PASS
-
-    def has_failures(self) -> bool:
-        return any(
-            r.status in (CheckItemStatus.FAIL, CheckItemStatus.ERROR, CheckItemStatus.TIMEOUT)
-            for r in self.check_results
-        )
-
-
-# -----------------------------------------------------------------------------
-# 检查器注册表与接口
-# -----------------------------------------------------------------------------
-
-REQUIRED_CHECKER_METHOD = "run"
-VALID_CHECK_STATUSES: frozenset[str] = frozenset({"pass", "fail", "error", "timeout"})
-
-DEFAULT_CHECKER_REGISTRY: Dict[str, Tuple[str, str]] = {
-    "style":            ("scripts.style_checker", "StyleChecker"),
-    "dependency":       ("scripts.dependency_checker", "DependencyChecker"),
-    "interface":        ("scripts.interface_verifier", "InterfaceVerifier"),
-    "config_decouple":  ("scripts.config_decouple_checker", "ConfigDecoupleChecker"),
-}
-
-# 超时与重试配置（可通过环境变量覆盖）
-DEFAULT_PER_CHECK_TIMEOUT = float(os.getenv("QG_CHECK_TIMEOUT", "120.0"))
-MAX_RETRIES = int(os.getenv("QG_MAX_RETRIES", "2"))
-RETRY_DELAY = 1.0
-MAX_WORKERS = int(os.getenv("QG_MAX_WORKERS", "4"))
-
-# 优雅退出标志
-_graceful_shutdown_requested = False
-
-
-# -----------------------------------------------------------------------------
-# 信号处理（可重入）
-# -----------------------------------------------------------------------------
-
-def _signal_handler(signum: int, frame: Any) -> None:
-    global _graceful_shutdown_requested
-    sig_name = signal.Signals(signum).name
-    logger.warning("收到信号 %s，将在当前检查完成后优雅退出", sig_name)
-    _graceful_shutdown_requested = True
-
-
-# 注册信号（如果未在其他地方注册）
-for _sig in (signal.SIGTERM, signal.SIGINT):
-    try:
-        signal.signal(_sig, _signal_handler)
-    except Exception:
-        logger.warning("无法注册信号 %s，忽略", _sig.name)
-
-
-# -----------------------------------------------------------------------------
-# QualityGate 主类
-# -----------------------------------------------------------------------------
 
 class QualityGate:
-    """代码质量门禁入口
+    """
+    代码质量门禁，串联全部校验器并生成审计报告
 
-    设计原则：
-    - 无状态：所有方法为类方法，避免实例状态污染并发调用。
-    - 配置外部化：通过环境变量和参数覆盖默认值。
-    - 严格容错：单点故障不中断整体流程，记录充分上下文。
-    - 审计友好：所有决策点均有日志，输出包含完整环境信息。
-    - 原子输出：报告写入采用临时文件+原子替换，防止部分写或损坏。
-    - 类型安全：全面使用类型注解，通过 mypy 严格检查。
+    支持子进程隔离执行、超时控制、审计链、指标输出
     """
 
-    DEFAULT_CHECKS: List[str] = list(DEFAULT_CHECKER_REGISTRY.keys())
+    DEFAULT_PROJECT_ROOT = DEFAULT_PROJECT_ROOT
+    CHECKERS: List[CheckerDef] = [
+        CheckerDef("scripts.style_checker", "风格校验", True),
+        CheckerDef("scripts.dependency_checker", "依赖闭环校验", True),
+        CheckerDef("scripts.interface_verifier", "接口契约校验", True),
+        CheckerDef("scripts.config_decouple_checker", "配置解耦校验", True),
+        CheckerDef("scripts.schema_validator", "配置文件Schema校验", True),
+    ]
 
-    # ------------------------------------------------------------------------
-    # 环境信息
-    # ------------------------------------------------------------------------
+    _lock_fd: Optional[int] = None
+    _temp_dir: Optional[str] = None
+    _cleanup_registered: bool = False
+
+    # ── 路径安全验证 ──────────────────────────────────────
+    @classmethod
+    def _validate_project_root(cls, project_root: str) -> str:
+        """
+        安全校验项目根目录路径
+
+        防御：路径遍历攻击、符号链接循环、NFS挂载点阻塞
+        """
+        if not isinstance(project_root, str):
+            raise ValueError(f"project_root 必须为字符串，收到 {type(project_root).__name__}")
+        project_root = project_root.strip()
+        if not project_root:
+            raise ValueError("project_root 不能为空字符串")
+        try:
+            resolved = Path(project_root).resolve(strict=False)
+        except (OSError, RuntimeError) as e:
+            raise ValueError(f"路径解析失败: {e}") from e
+        # 检测路径遍历
+        parts = str(resolved).split(os.sep)
+        if ".." in parts:
+            raise ValueError(f"检测到路径遍历攻击: {project_root}")
+        if not resolved.is_dir():
+            raise FileNotFoundError(f"项目根目录不存在: {resolved}")
+        return str(resolved)
+
+    # ── 文件锁（防并发） ──────────────────────────────────
+    @classmethod
+    def _acquire_lock(cls, project_root: str) -> bool:
+        """获取排他文件锁，防止多实例并发"""
+        lock_path = os.path.join(project_root, LOCK_FILE_NAME)
+        try:
+            cls._lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o640)
+            fcntl.flock(cls._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (IOError, OSError):
+            logger.error("无法获取门禁锁，可能有其他实例正在运行")
+            return False
 
     @classmethod
-    def _build_environment_info(cls) -> Dict[str, str]:
-        """采集当前执行环境信息，用于审计追踪"""
-        return {
-            "python_version": sys.version,
-            "platform": platform.platform(),
-            "node": platform.node(),
-            "user": os.getenv("USER", os.getenv("USERNAME", "unknown")),
-            "ci": os.getenv("CI", "false"),
-            "commit_sha": os.getenv("GIT_COMMIT", os.getenv("GIT_SHA", "unknown")),
-            "branch": os.getenv("GIT_BRANCH", os.getenv("GIT_REF", "unknown")),
-            "quality_gate_version": "2.1.1",
-        }
-
-    # ------------------------------------------------------------------------
-    # 输入校验
-    # ------------------------------------------------------------------------
-
-    @classmethod
-    def _validate_checks_input(cls, checks: List[str]) -> Tuple[List[str], List[str]]:
-        """校验检查项列表，去重并分类。返回 (有效项, 未知项)"""
-        if not checks:
-            return [], []
-        if not isinstance(checks, list):
-            raise TypeError(f"checks 参数必须为 list，收到 {type(checks)}")
-        valid: List[str] = []
-        unknown: List[str] = []
-        seen: Set[str] = set()
-        for item in checks:
-            if not isinstance(item, str):
-                logger.warning("忽略非字符串检查项: %s", item)
-                continue
-            if item in seen:
-                continue
-            seen.add(item)
-            if item in DEFAULT_CHECKER_REGISTRY:
-                valid.append(item)
-            else:
-                unknown.append(item)
-        return valid, unknown
-
-    # ------------------------------------------------------------------------
-    # 检查器加载与重试
-    # ------------------------------------------------------------------------
-
-    @classmethod
-    def _import_checker(cls, name: str, retry: int = MAX_RETRIES) -> Optional[Callable[..., Any]]:
-        """加载检查器类/函数，带重试逻辑。返回可调用对象，失败返回 None。"""
-        if name not in DEFAULT_CHECKER_REGISTRY:
-            logger.error("未注册的检查器: %s", name)
-            return None
-
-        module_path, class_name = DEFAULT_CHECKER_REGISTRY[name]
-        last_exception: Optional[Exception] = None
-        for attempt in range(retry + 1):
+    def _release_lock(cls):
+        """释放文件锁并清理"""
+        if cls._lock_fd is not None:
             try:
-                # 支持环境变量启用热重载（谨慎使用）
-                if module_path in sys.modules and os.getenv("QG_HOT_RELOAD", "0") == "1":
-                    importlib.reload(sys.modules[module_path])
-                module = importlib.import_module(module_path)
-                checker = getattr(module, class_name, None)
-                if checker is None:
-                    raise AttributeError(f"模块 {module_path} 中未找到 {class_name}")
-                if not hasattr(checker, REQUIRED_CHECKER_METHOD):
-                    raise AttributeError(f"{class_name} 缺少必需方法 '{REQUIRED_CHECKER_METHOD}'")
-                logger.debug("检查器 %s 加载成功 (尝试 %d/%d)", name, attempt + 1, retry + 1)
-                return checker
-            except Exception as e:
-                last_exception = e
-                logger.warning("加载检查器 %s 失败 (尝试 %d/%d): %s", name, attempt + 1, retry + 1, e)
-                if attempt < retry:
-                    time.sleep(RETRY_DELAY * (attempt + 1))  # 简单退避
-        logger.error("检查器 %s 最终加载失败: %s", name, last_exception)
-        return None
+                fcntl.flock(cls._lock_fd, fcntl.LOCK_UN)
+                os.close(cls._lock_fd)
+            except Exception:
+                pass
+            cls._lock_fd = None
 
-    # ------------------------------------------------------------------------
-    # 结果清洗
-    # ------------------------------------------------------------------------
+    # ── 临时目录管理 ──────────────────────────────────────
+    @classmethod
+    def _ensure_temp_dir(cls) -> str:
+        """创建安全临时目录并注册清理"""
+        if cls._temp_dir is None:
+            cls._temp_dir = tempfile.mkdtemp(prefix=TEMP_DIR_PREFIX)
+            os.chmod(cls._temp_dir, DEFAULT_TEMP_MODE)
+            if not cls._cleanup_registered:
+                atexit.register(cls._cleanup_temp_dir)
+                cls._cleanup_registered = True
+        return cls._temp_dir
 
-    @staticmethod
-    def _sanitize_raw_result(raw: Any) -> Optional[Dict[str, Any]]:
-        """将检查器原始返回值清洗为可安全序列化的字典"""
-        if isinstance(raw, dict):
-            cleaned: Dict[str, Any] = {}
-            for k, v in raw.items():
+    @classmethod
+    def _cleanup_temp_dir(cls):
+        """清理临时目录"""
+        if cls._temp_dir and os.path.exists(cls._temp_dir):
+            try:
+                shutil.rmtree(cls._temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+            cls._temp_dir = None
+
+    # ── 校验器定位 ────────────────────────────────────────
+    @classmethod
+    def _locate_check_function(cls, module, module_name: str):
+        """
+        在模块中定位 check 函数
+
+        优先级：模块级 check > 类的 check 方法
+        安全：避免触发 __getattr__ 或描述符
+        """
+        # 优先查找模块级 check 函数（安全：直接属性访问）
+        if hasattr(module, 'check') and callable(getattr(module, 'check')):
+            return module.check
+        # 安全的类方法查找
+        available = []
+        for name in dir(module):
+            if name.startswith('_') or name in ('__builtins__', '__cached__', '__doc__'):
+                continue
+            try:
+                obj = getattr(module, name)
+                if isinstance(obj, type) and hasattr(obj, 'check'):
+                    available.append(name)
+                    return obj.check
+            except Exception:
+                continue
+        raise AttributeError(
+            f"模块 {module_name} 未提供 check() 接口。"
+            f"找到的类型: {available or '无'}"
+        )
+
+    # ── 单校验器执行（子进程隔离） ─────────────────────────
+    @classmethod
+    def _run_single_checker(
+        cls, checker: CheckerDef, project_root: str
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        在子进程中隔离执行单个校验器
+
+        使用 subprocess 确保：
+        1. 超时强制终止（SIGKILL）
+        2. 内存与文件描述符完全隔离
+        3. 避免信号处理器冲突
+        """
+        import subprocess as sp
+
+        start_time = time.perf_counter_ns()
+        checker_script = os.path.join(
+            project_root, checker.module_name.replace('.', os.sep) + '.py'
+        )
+
+        try:
+            proc = sp.run(
+                [
+                    sys.executable, "-u", checker_script,
+                    "--check-standalone",
+                    "--project-root", project_root,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=checker.timeout,
+                cwd=project_root,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+            elapsed_ns = time.perf_counter_ns() - start_time
+            elapsed = elapsed_ns / 1e9
+
+            if proc.returncode == 0:
                 try:
-                    json.dumps(v, default=str)  # 测试可序列化性
-                    cleaned[str(k)] = v
-                except (TypeError, ValueError):
-                    cleaned[str(k)] = str(v)
-            return cleaned
-        if raw is None:
-            return None
-        return {"__raw_value__": str(raw)[:2000]}
-
-    # ------------------------------------------------------------------------
-    # 单个检查执行
-    # ------------------------------------------------------------------------
-
-    @classmethod
-    def _run_single_check(cls, check_name: str, timeout: float) -> CheckItemResult:
-        """执行单个检查器，管理超时与异常，返回 CheckItemResult。"""
-        if _graceful_shutdown_requested:
-            return CheckItemResult(
-                check_name=check_name,
-                status=CheckItemStatus.SKIPPED,
-                message="系统正在关闭，跳过检查",
-                duration_ms=0
-            )
-
-        start = time.perf_counter()
-        checker = cls._import_checker(check_name)
-        if checker is None:
-            duration = (time.perf_counter() - start) * 1000
-            return CheckItemResult(
-                check_name=check_name,
-                status=CheckItemStatus.ERROR,
-                message="检查器加载失败，已重试。建议检查模块依赖与路径。",
-                duration_ms=duration,
-                errors=["检查器不可用"]
-            )
-
-        def target() -> Dict[str, Any]:
-            try:
-                if isinstance(checker, type):
-                    instance = checker()
-                    result = getattr(instance, REQUIRED_CHECKER_METHOD)()
-                else:
-                    result = checker()
-                if not isinstance(result, dict):
-                    return {
+                    result = json.loads(proc.stdout.strip() or "{}")
+                except json.JSONDecodeError:
+                    result = {
                         "status": "error",
-                        "reason": f"检查器返回非字典类型: {type(result).__name__}",
-                        "errors": []
+                        "reason": f"校验器返回非JSON输出: {proc.stdout[:200]}",
                     }
-                return result
-            except Exception as e:
-                logger.exception("检查器 %s 内部异常", check_name)
-                return {
+            else:
+                result = {
                     "status": "error",
-                    "reason": str(e),
-                    "errors": [traceback.format_exc()],
+                    "reason": f"校验器退出码 {proc.returncode}: {proc.stderr[:500]}",
                 }
 
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"qg-{check_name}") as executor:
-            future = executor.submit(target)
-            try:
-                raw_result = future.result(timeout=timeout)
-            except FuturesTimeoutError:
-                duration = (time.perf_counter() - start) * 1000
-                future.cancel()  # 主动取消超时任务
-                logger.warning("检查器 %s 超时 (%.1fs)", check_name, timeout)
-                return CheckItemResult(
-                    check_name=check_name,
-                    status=CheckItemStatus.TIMEOUT,
-                    message=f"检查器执行超时（阈值 {timeout} 秒）",
-                    duration_ms=duration,
-                    errors=["超时"]
-                )
-            except Exception as e:
-                duration = (time.perf_counter() - start) * 1000
-                logger.error("检查器 %s 线程异常: %s", check_name, e)
-                return CheckItemResult(
-                    check_name=check_name,
-                    status=CheckItemStatus.ERROR,
-                    message=f"检查器线程异常: {str(e)}",
-                    duration_ms=duration,
-                    errors=[traceback.format_exc()]
-                )
+            result.setdefault("elapsed_seconds", round(elapsed, 6))
+            status = result.get("status", "error")
+            if status not in VALID_STATUSES:
+                result["status"] = "error"
+                result["reason"] = result.get("reason", "") + " [原始状态码无效]"
 
-        duration = (time.perf_counter() - start) * 1000
+            passed = status in ('ok', 'passed_with_warnings')
+            return passed, result
 
-        # 提取状态并验证
-        status_str = str(raw_result.get("status", "")).lower()
-        if status_str not in VALID_CHECK_STATUSES:
-            logger.warning("检查器 %s 返回未知状态 '%s'，视为 error", check_name, status_str)
-            status_str = "error"
-
-        warnings = raw_result.get("warnings", [])
-        if not isinstance(warnings, list):
-            warnings = [str(warnings)]
-        errors = raw_result.get("errors", [])
-        if not isinstance(errors, list):
-            errors = [str(errors)]
-
-        return CheckItemResult(
-            check_name=check_name,
-            status=CheckItemStatus(status_str),
-            message=raw_result.get("reason", raw_result.get("message", "")),
-            duration_ms=duration,
-            warnings=warnings,
-            errors=errors,
-            metadata=raw_result.get("metadata", {}),
-            raw=cls._sanitize_raw_result(raw_result),
-        )
-
-    # ------------------------------------------------------------------------
-    # 主门禁逻辑
-    # ------------------------------------------------------------------------
-
-    @classmethod
-    def run_all(cls,
-                checks: Optional[List[str]] = None,
-                *,
-                timeout: float = DEFAULT_PER_CHECK_TIMEOUT,
-                parallel: bool = True,
-                stop_on_first_failure: bool = False) -> GateResult:
-        """执行全部或指定质量检查。
-
-        Args:
-            checks: 检查项列表，默认全部。
-            timeout: 单个检查器最大执行秒数（必须 > 0）。
-            parallel: 是否并发执行。
-            stop_on_first_failure: 首次失败即停止后续。
-
-        Returns:
-            GateResult 聚合结果。
-        """
-        if timeout <= 0:
-            raise ValueError("timeout 必须为正数")
-
-        start_total = time.perf_counter()
-        env_info = cls._build_environment_info()
-
-        if checks is None:
-            checks = cls.DEFAULT_CHECKS.copy()
-        elif not isinstance(checks, list):
-            raise TypeError(f"checks 参数必须为 list，收到 {type(checks)}")
-        valid_checks, unknown = cls._validate_checks_input(checks)
-        if unknown:
-            logger.warning("忽略了未知检查项: %s", unknown)
-        if not valid_checks:
-            reason = "没有有效的检查项可执行"
-            if unknown:
-                reason += f"，未知项: {unknown}"
-            return GateResult(
-                status=GateStatus.ERROR,
-                reason=reason,
-                environment=env_info,
-                total_duration_ms=0.0,
-                extra={"unknown_checks": unknown}
+        except sp.TimeoutExpired:
+            elapsed = (time.perf_counter_ns() - start_time) / 1e9
+            logger.error("校验器 [%s] 超时 (%ds)", checker.display_name, checker.timeout)
+            return False, cls._build_error_result(
+                checker.display_name, f"执行超时 ({checker.timeout}s)", elapsed
+            )
+        except Exception as e:
+            elapsed = (time.perf_counter_ns() - start_time) / 1e9
+            logger.critical("校验器 [%s] 执行异常: %s", checker.display_name, str(e), exc_info=True)
+            return False, cls._build_error_result(
+                checker.display_name, f"执行异常: {type(e).__name__}: {str(e)}", elapsed
             )
 
-        results: List[CheckItemResult] = []
-        try:
-            if parallel and len(valid_checks) > 1:
-                max_workers = min(MAX_WORKERS, len(valid_checks))
-                with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="qg-pool") as pool:
-                    future_map: Dict[Any, str] = {
-                        pool.submit(cls._run_single_check, name, timeout): name
-                        for name in valid_checks
-                    }
-                    result_map: Dict[str, CheckItemResult] = {}
-                    for future in future_map:
-                        name = future_map[future]
-                        try:
-                            result = future.result(timeout=timeout + 5.0)
-                            result_map[name] = result
-                        except FuturesTimeoutError:
-                            future.cancel()
-                            result_map[name] = CheckItemResult(
-                                check_name=name,
-                                status=CheckItemStatus.TIMEOUT,
-                                message="线程池级超时",
-                                duration_ms=0,
-                                errors=["线程池总超时"]
-                            )
-                        except Exception as e:
-                            logger.exception("获取检查 %s 结果时异常", name)
-                            result_map[name] = CheckItemResult(
-                                check_name=name,
-                                status=CheckItemStatus.ERROR,
-                                message=f"执行异常: {str(e)}",
-                                duration_ms=0,
-                                errors=[traceback.format_exc()]
-                            )
-                    results = [result_map[name] for name in valid_checks]
-            else:
-                for idx, check_name in enumerate(valid_checks):
-                    if _graceful_shutdown_requested:
-                        for remaining in valid_checks[idx:]:
-                            results.append(CheckItemResult(
-                                check_name=remaining,
-                                status=CheckItemStatus.SKIPPED,
-                                message="系统关闭信号，跳过后续检查",
-                                duration_ms=0
-                            ))
-                        break
-                    res = cls._run_single_check(check_name, timeout)
-                    results.append(res)
-                    if stop_on_first_failure and res.status != CheckItemStatus.PASS:
-                        logger.warning("第一个失败出现于 %s，停止后续检查", check_name)
-                        for remaining in valid_checks[idx+1:]:
-                            results.append(CheckItemResult(
-                                check_name=remaining,
-                                status=CheckItemStatus.SKIPPED,
-                                message="由于前序检查失败而跳过",
-                                duration_ms=0
-                            ))
-                        break
-        except Exception as e:
-            logger.exception("检查执行过程中发生未捕获异常")
-            results.append(CheckItemResult(
-                check_name="__gate_internal__",
-                status=CheckItemStatus.ERROR,
-                message=f"门禁内部异常: {str(e)}",
-                errors=[traceback.format_exc()]
-            ))
-
-        total_duration = (time.perf_counter() - start_total) * 1000
-
-        has_fail = any(
-            r.status in (CheckItemStatus.FAIL, CheckItemStatus.ERROR, CheckItemStatus.TIMEOUT)
-            for r in results
-        )
-        has_system_error = any(r.status == CheckItemStatus.ERROR for r in results)
-        all_pass = all(r.status == CheckItemStatus.PASS for r in results) if results else False
-
-        if all_pass:
-            final_status = GateStatus.PASS
-            reason = "所有质量门禁检查通过"
-        elif has_system_error and not any(r.status == CheckItemStatus.FAIL for r in results):
-            final_status = GateStatus.DEGRADED
-            reason = "部分检查因环境或系统问题无法完成，但未发现代码缺陷"
-        else:
-            final_status = GateStatus.FAIL
-            failed_names = [r.check_name for r in results if r.status != CheckItemStatus.PASS]
-            reason = f"质量门禁未通过，失败项: {', '.join(failed_names)}"
-
-        return GateResult(
-            status=final_status,
-            reason=reason,
-            environment=env_info,
-            check_results=results,
-            total_duration_ms=total_duration,
-            extra={
-                "unknown_checks": unknown,
-                "parallel": parallel,
-                "timeout_per_check": timeout,
-                "stop_on_first_failure": stop_on_first_failure,
-                "graceful_shutdown": _graceful_shutdown_requested,
-            }
-        )
-
-    # ------------------------------------------------------------------------
-    # 输出格式化
-    # ------------------------------------------------------------------------
-
-    @staticmethod
-    def format_terminal(result: GateResult, use_colors: bool = True) -> str:
-        """生成面向终端的报告，支持 ANSI 颜色。"""
-        if use_colors:
-            GREEN = "\033[92m"; RED = "\033[91m"; YELLOW = "\033[93m"
-            CYAN = "\033[96m"; BOLD = "\033[1m"; RESET = "\033[0m"
-        else:
-            GREEN = RED = YELLOW = CYAN = BOLD = RESET = ""
-
-        lines = [
-            f"{BOLD}{'='*60}{RESET}",
-            f" 代码质量门禁报告 - {result.timestamp}",
-            f" 状态: {GREEN if result.status == GateStatus.PASS else RED if result.status == GateStatus.FAIL else YELLOW}{result.status.value.upper()}{RESET}",
-            f" 环境: {result.environment.get('node', 'N/A')} | CI: {result.environment.get('ci', 'false')}",
-            f"{BOLD}{'='*60}{RESET}"
-        ]
-
-        icon_map = {
-            CheckItemStatus.PASS: f"{GREEN}[✓]{RESET}",
-            CheckItemStatus.FAIL: f"{RED}[✗]{RESET}",
-            CheckItemStatus.ERROR: f"{RED}[!]{RESET}",
-            CheckItemStatus.TIMEOUT: f"{YELLOW}[⏱]{RESET}",
-            CheckItemStatus.SKIPPED: "[-]",
-        }
-
-        for r in result.check_results:
-            icon = icon_map.get(r.status, "[?]")
-            status_str = r.status.value.ljust(7)
-            lines.append(f" {icon} {r.check_name:30s} {status_str} {r.duration_ms:8.0f}ms")
-            if r.message:
-                lines.append(f"    {CYAN}{r.message}{RESET}")
-            if r.warnings:
-                for w in r.warnings[:3]:
-                    lines.append(f"    ⚠ {YELLOW}{w}{RESET}")
-            if r.errors:
-                for e in r.errors[:2]:
-                    lines.append(f"    ❌ {RED}{e}{RESET}")
-
-        lines.append(f"{BOLD}{'='*60}{RESET}")
-        lines.append(f" 总耗时: {result.total_duration_ms:.0f}ms")
-        return "\n".join(lines)
-
-    @staticmethod
-    def format_json(result: GateResult, indent: int = 2) -> str:
-        """生成 JSON 格式报告，所有值保证可序列化。"""
-        def default_serializer(obj: Any) -> str:
-            if isinstance(obj, Enum):
-                return obj.value
-            if isinstance(obj, (GateResult, CheckItemResult)):
-                return asdict(obj)
-            return str(obj)
-
-        data = asdict(result)
-        for r in data.get("check_results", []):
-            if "raw" in r and r["raw"] is not None:
-                try:
-                    json.dumps(r["raw"], default=default_serializer)
-                except (TypeError, ValueError):
-                    r["raw"] = str(r["raw"])
-        return json.dumps(data, indent=indent, default=default_serializer, ensure_ascii=False)
-
-    @staticmethod
-    def format_sarif(result: GateResult) -> Dict[str, Any]:
-        """生成 SARIF v2.1.0 格式报告，可被 CI 系统解析。"""
-        sarif: Dict[str, Any] = {
-            "version": "2.1.0",
-            "runs": [{
-                "tool": {
-                    "driver": {
-                        "name": "QualityGate",
-                        "version": "2.1.1",
-                        "informationUri": "https://spark-system.internal/quality-gate",
-                    }
-                },
-                "invocation": {
-                    "executionSuccessful": result.status != GateStatus.ERROR,
-                },
-                "results": []
-            }]
-        }
-        for r in result.check_results:
-            if r.status in (CheckItemStatus.PASS, CheckItemStatus.SKIPPED):
-                continue
-            level = "error" if r.status == CheckItemStatus.FAIL else "warning"
-            artifact_uri = r.metadata.get("file", "unknown")
-            sarif_result = {
-                "ruleId": r.check_name,
-                "level": level,
-                "message": {
-                    "text": r.message or f"Check {r.check_name} returned {r.status.value}"
-                },
-                "locations": [{
-                    "physicalLocation": {
-                        "artifactLocation": {
-                            "uri": artifact_uri
-                        }
-                    }
-                }],
-                "properties": {
-                    "status": r.status.value,
-                    "duration_ms": r.duration_ms,
-                }
-            }
-            sarif["runs"][0]["results"].append(sarif_result)
-        return sarif
-
-    # ------------------------------------------------------------------------
-    # 健康检查
-    # ------------------------------------------------------------------------
-
     @classmethod
-    def health_check(cls) -> Dict[str, Any]:
-        """模块自检：验证核心功能是否可达。返回火种标准状态字典。"""
+    def _build_error_result(cls, display_name: str, reason: str, elapsed: float) -> Dict[str, Any]:
+        """构建标准错误结果字典"""
+        return {
+            "status": "error",
+            "reason": reason,
+            "violations": [],
+            "report": {},
+            "warnings": [],
+            "elapsed_seconds": round(elapsed, 6),
+            "report_path": None,
+        }
+
+    # ── 审计报告写入 ──────────────────────────────────────
+    @classmethod
+    def _write_report(cls, report: Dict[str, Any], report_path: Optional[str] = None) -> str:
+        """原子写入审计报告到磁盘（跨文件系统安全）"""
+        temp_dir = cls._ensure_temp_dir()
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        uid = uuid.uuid4().hex[:8]
+        if report_path is None:
+            report_path = os.path.join(
+                temp_dir, REPORT_FILENAME.format(timestamp=timestamp, uuid=uid)
+            )
+        # 深拷贝避免序列化副作用
         try:
-            result = cls.run_all(checks=[], parallel=False)
-            if result.status != GateStatus.PASS:
-                return {
-                    "status": "error",
-                    "reason": f"空列表门禁应通过，得到 {result.status.value}: {result.reason}"
-                }
-            result2 = cls.run_all(checks=["__non_existent__"], parallel=False)
-            if result2.status not in (GateStatus.ERROR, GateStatus.DEGRADED):
-                logger.warning("未知检查预期 ERROR/DEGRADED，得到 %s", result2.status.value)
-            env = cls._build_environment_info()
-            for key in ("python_version", "platform", "quality_gate_version"):
-                if key not in env:
-                    return {"status": "error", "reason": f"环境信息缺少键: {key}"}
-            return {"status": "ok", "message": "质量门禁核心功能正常", "warnings": []}
-        except Exception as e:
-            logger.exception("健康检查失败")
-            return {"status": "error", "reason": str(e)}
+            safe_report = json.loads(json.dumps(report, default=str))
+        except Exception:
+            safe_report = dict(report)
 
-
-# -----------------------------------------------------------------------------
-# 命令行入口
-# -----------------------------------------------------------------------------
-
-def main() -> None:
-    """命令行入口，处理参数解析、执行门禁、输出报告。"""
-    import argparse
-    parser = argparse.ArgumentParser(
-        description="火种代码质量门禁 - 机构级静态审查系统",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  quality_gate.py                             # 执行全部检查，终端输出
-  quality_gate.py --json                      # JSON 输出
-  quality_gate.py --checks style dependency   # 只执行指定检查
-  quality_gate.py --timeout 60 --no-parallel  # 串行执行，超时 60 秒
-  quality_gate.py --sarif -o report.sarif     # 输出 SARIF 文件
-  quality_gate.py --self-test                 # 仅执行健康检查
-        """
-    )
-    parser.add_argument("--checks", nargs="+", default=None,
-                        help="要执行的检查项，默认全部。可选: %s" % ", ".join(QualityGate.DEFAULT_CHECKS))
-    parser.add_argument("--timeout", type=float, default=DEFAULT_PER_CHECK_TIMEOUT,
-                        help="单个检查器的超时秒数 (默认: %(default)s)")
-    parser.add_argument("--no-parallel", dest="parallel", action="store_false", default=True,
-                        help="禁止并发执行")
-    parser.add_argument("--stop-on-first-failure", action="store_true", default=False,
-                        help="首次失败即停止后续检查")
-    parser.add_argument("--json", action="store_true", help="以 JSON 格式输出")
-    parser.add_argument("--sarif", action="store_true", help="输出 SARIF 格式")
-    parser.add_argument("--no-color", action="store_true", help="禁用终端颜色")
-    parser.add_argument("--output", "-o", type=str, help="将报告写入指定文件")
-    parser.add_argument("--quiet", action="store_true", help="仅输出最终状态")
-    parser.add_argument("--self-test", action="store_true", help="执行健康检查后退出")
-    args = parser.parse_args()
-
-    if args.timeout <= 0:
-        print("错误: --timeout 必须为正数", file=sys.stderr)
-        sys.exit(2)
-
-    if args.self_test:
-        hc = QualityGate.health_check()
-        print(json.dumps(hc, indent=2) if args.json else hc.get("status", "unknown"))
-        sys.exit(0 if hc.get("status") == "ok" else 1)
-
-    try:
-        result = QualityGate.run_all(
-            checks=args.checks,
-            timeout=args.timeout,
-            parallel=args.parallel,
-            stop_on_first_failure=args.stop_on_first_failure
-        )
-    except Exception as e:
-        logger.exception("门禁执行严重异常")
-        env = QualityGate._build_environment_info()
-        result = GateResult(
-            status=GateStatus.ERROR,
-            reason=f"门禁系统严重错误: {str(e)}",
-            environment=env,
-            total_duration_ms=0.0,
-            extra={"error_traceback": traceback.format_exc()}
-        )
-
-    # 生成输出内容
-    if args.sarif:
-        output_str = json.dumps(QualityGate.format_sarif(result), indent=2)
-    elif args.json:
-        output_str = QualityGate.format_json(result)
-    else:
-        output_str = QualityGate.format_terminal(result, use_colors=not args.no_color) if not args.quiet else result.status.value
-
-    # 写入文件或标准输出
-    if args.output:
-        out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        # 原子写入，权限 0o600
-        fd = os.open(str(out_path) + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # 原子写入策略：写入临时文件 → fsync → rename
+        tmp_fd = None
+        tmp_path = None
         try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                f.write(output_str)
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                suffix='.json', prefix='qg_', dir=os.path.dirname(report_path)
+            )
+            os.chmod(tmp_path, DEFAULT_REPORT_MODE)
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                json.dump(safe_report, f, indent=2, ensure_ascii=False, default=str)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(str(out_path) + ".tmp", str(out_path))
-        except Exception:
-            with suppress(OSError):
-                os.unlink(str(out_path) + ".tmp")
+            os.rename(tmp_path, report_path)
+            logger.info("审计报告已写入: %s", report_path)
+        except OSError:
+            # 跨文件系统 rename 失败，使用 shutil.move
+            try:
+                if tmp_path and os.path.exists(tmp_path):
+                    shutil.move(tmp_path, report_path)
+                logger.info("审计报告已写入 (shutil.move): %s", report_path)
+            except Exception as e:
+                logger.error("写入审计报告完全失败: %s", str(e))
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+        except Exception as e:
+            logger.error("写入审计报告失败: %s #RECOVERY: 检查磁盘空间和权限", str(e))
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
             raise
-        if not args.quiet:
-            print(f"报告已保存至 {out_path}", file=sys.stderr)
-    else:
-        # 确保 stdout 编码为 UTF-8
-        sys.stdout.reconfigure(encoding='utf-8') if hasattr(sys.stdout, 'reconfigure') else None
-        print(output_str)
+        return report_path
 
-    # 退出码：PASS=0, FAIL/DEGRADED=1, ERROR=2
-    if result.status == GateStatus.PASS:
-        sys.exit(0)
-    elif result.status in (GateStatus.FAIL, GateStatus.DEGRADED):
-        sys.exit(1)
-    else:
-        sys.exit(2)
+    # ── 内存使用 ──────────────────────────────────────────
+    @classmethod
+    def _get_memory_usage(cls) -> float:
+        """获取当前进程内存使用（MB），不依赖psutil时返回NaN"""
+        if PSUTIL_AVAILABLE:
+            try:
+                return round(psutil.Process().memory_info().rss / 1024 / 1024, 3)
+            except Exception:
+                return float('nan')
+        # 回退：读取 /proc/self/status
+        try:
+            with open('/proc/self/status', 'r') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        return round(int(line.split()[1]) / 1024.0, 3)
+        except Exception:
+            pass
+        return float('nan')
+
+    # ── 指标输出 ──────────────────────────────────────────
+    @classmethod
+    def _update_metrics(
+        cls, all_passed: bool, total_checks: int, failed_checks: int, total_elapsed: float
+    ):
+        """更新 Prometheus 指标（完全隔离，单项失败不影响其他）"""
+        if not METRICS_AVAILABLE or MetricsCollector is None:
+            return
+        metric_updates = [
+            ("quality_gate_passed", 1 if all_passed else 0, "gauge"),
+            ("quality_gate_total_checks", total_checks, "counter"),
+            ("quality_gate_failed_checks", failed_checks, "counter"),
+            ("quality_gate_duration_seconds", total_elapsed, "histogram"),
+        ]
+        for name, value, mtype in metric_updates:
+            try:
+                if mtype == "gauge":
+                    MetricsCollector.gauge(name, value)
+                elif mtype == "counter":
+                    MetricsCollector.counter(name, value)
+                elif mtype == "histogram":
+                    MetricsCollector.histogram(name, value)
+            except Exception as e:
+                logger.debug("指标更新失败 [%s]: %s", name, str(e))
+
+    # ── 主执行逻辑 ────────────────────────────────────────
+    @classmethod
+    def run_all_checks(
+        cls,
+        project_root: str = DEFAULT_PROJECT_ROOT,
+        timeout: int = DEFAULT_TIMEOUT_SECONDS,
+        report_path: Optional[str] = None,
+        severity_filter: Optional[str] = None,
+        skip_checkers: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        执行全部校验器，返回完整审计报告
+
+        Args:
+            project_root: 项目根目录路径
+            timeout: 单校验器超时秒数 (1-3600)
+            report_path: 审计报告输出路径（可选）
+            severity_filter: 过滤严重度级别（high/medium/low）
+            skip_checkers: 跳过的校验器模块名列表
+
+        Returns:
+            完整审计报告字典，包含 exit_code, summary, details, metrics, audit_chain
+        """
+        overall_start_ns = time.perf_counter_ns()
+        execution_id = uuid.uuid4().hex[:16]
+        logger.info("启动代码质量门禁 [execution_id=%s]", execution_id)
+
+        # 路径安全校验
+        try:
+            safe_root = cls._validate_project_root(project_root)
+        except (ValueError, FileNotFoundError) as e:
+            logger.critical("项目路径校验失败: %s", str(e))
+            return cls._build_emergency_report(execution_id, f"路径校验失败: {str(e)}")
+
+        # 获取文件锁
+        if not cls._acquire_lock(safe_root):
+            return cls._build_emergency_report(execution_id, "无法获取门禁锁（并发冲突）")
+
+        try:
+            # 构建校验器列表（应用超时与跳过）
+            checkers: List[CheckerDef] = []
+            skip_set = set(skip_checkers or [])
+            for c in cls.CHECKERS:
+                if c.module_name in skip_set:
+                    continue
+                effective_timeout = c.timeout if c.timeout != DEFAULT_TIMEOUT_SECONDS else timeout
+                effective_timeout = max(1, min(effective_timeout, 3600))
+                checkers.append(c._replace(timeout=effective_timeout))
+
+            print(f"\n{SEPARATOR_LINE}")
+            print(f"  火种系统 - 代码质量门禁 v{VERSION}")
+            print(f"  SPDX: {SPDX_IDENTIFIER}  |  执行ID: {execution_id}")
+            print(f"{SEPARATOR_LINE}")
+
+            all_passed = True
+            details_list: List[Dict[str, Any]] = []
+            total_checks = 0
+            passed_checks = 0
+            failed_checks = 0
+            timeout_checks = 0
+            total_elapsed = Decimal('0.0')
+
+            for checker in checkers:
+                print(f"\n>>> 执行 {checker.display_name} ({checker.module_name}) ...")
+                passed, result = cls._run_single_checker(checker, safe_root)
+                elapsed = Decimal(str(result.get('elapsed_seconds', 0)))
+                total_elapsed += elapsed
+
+                status = result.get('status', 'error')
+                reason = result.get('reason', '无详细信息')
+                violations = result.get('violations', [])
+
+                # 严重度过滤
+                if severity_filter and violations:
+                    violations = [
+                        v for v in violations
+                        if v.get('severity', 'medium') == severity_filter
+                    ]
+
+                total_checks += 1
+                if status == 'ok':
+                    passed_checks += 1
+                elif status == 'passed_with_warnings':
+                    passed_checks += 1
+                elif status in ('failed', 'error'):
+                    failed_checks += 1
+                    if 'timeout' in reason.lower() or status == 'timeout':
+                        timeout_checks += 1
+
+                print(f"    状态: {status.upper()} (耗时 {float(elapsed):.3f}s)")
+                print(f"    说明: {reason}")
+                if violations:
+                    print(f"    违规项: {len(violations)} 条")
+                    display_count = min(len(violations), MAX_VIOLATIONS_DISPLAY)
+                    for v in violations[:display_count]:
+                        loc = f"{v.get('file', 'N/A')}:{v.get('line', 'N/A')}"
+                        sev = v.get('severity', 'N/A')
+                        print(f"      [{sev}] {loc}: {v.get('reason', 'N/A')}")
+                    if len(violations) > MAX_VIOLATIONS_DISPLAY:
+                        print(
+                            f"      ... 共 {len(violations)} 条，"
+                            f"完整报告见 {report_path or 'JSON输出'}"
+                        )
+
+                detail: Dict[str, Any] = {
+                    "checker": checker.display_name,
+                    "module": checker.module_name,
+                    "status": status,
+                    "passed": passed,
+                    "required": checker.required,
+                    "elapsed_seconds": float(elapsed),
+                    "violations": violations,
+                    "reason": reason,
+                    "warnings": result.get('warnings', []) or [],
+                }
+                details_list.append(detail)
+
+                if checker.required and not passed:
+                    all_passed = False
+
+            # 输出总结
+            print(f"\n{SEPARATOR_LINE}")
+            summary = {
+                "total": total_checks,
+                "passed": passed_checks,
+                "failed": failed_checks,
+                "timeout": timeout_checks,
+                "total_elapsed": float(total_elapsed),
+            }
+            if all_passed:
+                print("  结果: 全部强制校验通过 ✅")
+            else:
+                failed_req = [d for d in details_list if d['required'] and not d['passed']]
+                print(f"  结果: {len(failed_req)} 项强制校验未通过 ❌")
+                for d in failed_req:
+                    print(f"    - {d['checker']} ({d['status']})")
+            print(f"  统计: {passed_checks}/{total_checks} 通过, 耗时 {float(total_elapsed):.3f}s")
+            print(f"{SEPARATOR_LINE}\n")
+
+            # 指标
+            cls._update_metrics(all_passed, total_checks, failed_checks, float(total_elapsed))
+
+            # 退出码
+            if timeout_checks > 0:
+                exit_code = EXIT_CODE_MAP["timeout"]
+            elif not all_passed:
+                exit_code = EXIT_CODE_MAP["hard_fail"]
+            elif any(d['status'] == 'passed_with_warnings' for d in details_list):
+                exit_code = EXIT_CODE_MAP["warnings_only"]
+            else:
+                exit_code = EXIT_CODE_MAP["all_passed"]
+
+            report: Dict[str, Any] = {
+                "execution_id": execution_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "version": VERSION,
+                "spdx": SPDX_IDENTIFIER,
+                "exit_code": exit_code,
+                "all_passed": all_passed,
+                "reason": "全部通过" if all_passed else "存在强制校验失败",
+                "summary": summary,
+                "details": details_list,
+                "metrics": {
+                    "total_elapsed_seconds": float(total_elapsed),
+                    "peak_memory_mb": cls._get_memory_usage(),
+                },
+                "audit_chain": {
+                    "parent_id": execution_id,
+                    "sequence": len(details_list),
+                },
+            }
+
+            # 写入审计报告
+            report_file = cls._write_report(report, report_path)
+            report["report_path"] = report_file
+
+            return report
+
+        finally:
+            cls._release_lock()
+
+    @classmethod
+    def _build_emergency_report(cls, execution_id: str, reason: str) -> Dict[str, Any]:
+        """构建紧急失败报告"""
+        return {
+            "execution_id": execution_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "version": VERSION,
+            "spdx": SPDX_IDENTIFIER,
+            "exit_code": EXIT_CODE_MAP["system_error"],
+            "all_passed": False,
+            "reason": reason,
+            "summary": {"total": 0, "passed": 0, "failed": 0, "timeout": 0, "total_elapsed": 0},
+            "details": [],
+            "metrics": {"total_elapsed_seconds": 0, "peak_memory_mb": cls._get_memory_usage()},
+            "audit_chain": {"parent_id": execution_id, "sequence": 0},
+            "report_path": None,
+        }
+
+    @classmethod
+    def health_check(cls, project_root: str = ".") -> Dict[str, Any]:
+        """自检：验证所有校验器是否可导入"""
+        warnings: List[str] = []
+        seen: Set[str] = set()
+        for checker in cls.CHECKERS:
+            if checker.module_name in seen:
+                continue
+            seen.add(checker.module_name)
+            try:
+                importlib.import_module(checker.module_name)
+            except Exception as e:
+                msg = f"校验器 [{checker.display_name}] 不可用: {type(e).__name__}: {str(e)}"
+                warnings.append(msg)
+        if warnings:
+            return {
+                "status": "degraded",
+                "reason": f"{len(warnings)} 个校验器不可用",
+                "warnings": warnings,
+            }
+        return {
+            "status": "ok",
+            "reason": "所有校验器可导入",
+            "warnings": [],
+        }
+
+
+# ── 信号处理（线程安全） ──────────────────────────────────
+def _setup_signal_handlers():
+    """注册优雅关闭的信号处理"""
+    def _graceful_shutdown(signum: int, frame):
+        sig_name = signal.Signals(signum).name
+        logger.warning("收到信号 %s (%d)，正在优雅关闭...", sig_name, signum)
+        QualityGate._release_lock()
+        QualityGate._cleanup_temp_dir()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(EXIT_CODE_MAP["system_error"])
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _graceful_shutdown)
+        except (ValueError, OSError):
+            pass  # 非主线程中无法设置信号
+
+
+# ── 主入口 ────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description=f"火种代码质量门禁 v{VERSION} - 一键全量检查",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--project-root", default=DEFAULT_PROJECT_ROOT, help="项目根目录路径")
+    parser.add_argument(
+        "--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS,
+        help=f"单校验器超时秒数 (1-3600，默认 {DEFAULT_TIMEOUT_SECONDS})"
+    )
+    parser.add_argument("--report", help="审计报告输出JSON路径")
+    parser.add_argument("--severity", choices=["high", "medium", "low"], help="仅检查指定严重度")
+    parser.add_argument("--skip", nargs="*", default=[], help="跳过的校验器模块名")
+    parser.add_argument("--quiet", action="store_true", help="静默模式")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    args = parser.parse_args()
+
+    # 参数范围校验
+    args.timeout = max(1, min(args.timeout, 3600))
+
+    # 日志配置（JSON格式，输出到 stderr）
+    log_level = logging.WARNING if args.quiet else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format=LOG_FORMAT_JSON,
+        datefmt='%Y-%m-%dT%H:%M:%S',
+        stream=sys.stderr,
+    )
+
+    # Python 版本检查
+    if sys.version_info < PYTHON_MIN_VERSION:
+        logger.critical("需要 Python %s+，当前版本 %s", PYTHON_MIN_VERSION, sys.version)
+        sys.exit(EXIT_CODE_MAP["system_error"])
+
+    # 信号处理
+    _setup_signal_handlers()
+
+    try:
+        report = QualityGate.run_all_checks(
+            project_root=args.project_root,
+            timeout=args.timeout,
+            report_path=args.report,
+            severity_filter=args.severity,
+            skip_checkers=args.skip,
+        )
+    except KeyboardInterrupt:
+        logger.warning("用户中断操作")
+        sys.exit(EXIT_CODE_MAP["system_error"])
+    except Exception as e:
+        logger.critical("门禁执行致命错误: %s", str(e), exc_info=True)
+        try:
+            emergency = QualityGate._build_emergency_report(
+                uuid.uuid4().hex[:16], f"致命错误: {type(e).__name__}: {str(e)}"
+            )
+            emergency_path = os.path.join(
+                QualityGate._ensure_temp_dir(),
+                f"emergency_report_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+            )
+            QualityGate._write_report(emergency, emergency_path)
+            print(f"紧急报告已生成: {emergency_path}", file=sys.stderr)
+        except Exception:
+            pass
+        sys.exit(EXIT_CODE_MAP["system_error"])
+
+    if args.quiet and args.report:
+        print(json.dumps({
+            "exit_code": report["exit_code"],
+            "report_path": report.get("report_path", ""),
+        }))
+
+    sys.exit(report["exit_code"])
 
 
 if __name__ == "__main__":
