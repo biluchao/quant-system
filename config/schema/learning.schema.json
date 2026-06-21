@@ -1,0 +1,399 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spark-quant.internal/schemas/learning.schema.json",
+  "title": "Adaptive Learning Configuration",
+  "description": "Configuration schema for the Spark system's reinforcement learning meta-controller and adaptive parameter tuner. All numeric values are validated against strict boundaries. Additional constraints (e.g., search interval lower < upper) are enforced at the application layer.",
+  "type": "object",
+  "$comment": "This schema is designed for trillion-dollar production accounts. Every field is strictly validated. Application-layer code must additionally verify that parameter_bounds arrays satisfy lower < upper.",
+  "unevaluatedProperties": false,
+  "propertyNames": {
+    "pattern": "^[a-z][a-z0-9_]*$",
+    "description": "All property names must be lowercase snake_case."
+  },
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "title": "Schema Version",
+      "description": "Semantic version of this configuration file (SemVer). Used to detect format changes and trigger migration.",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(-[a-zA-Z0-9.]+)?(\\+[a-zA-Z0-9.]+)?$",
+      "minLength": 5,
+      "maxLength": 64,
+      "default": "1.0.0"
+    },
+    "enabled": {
+      "type": "boolean",
+      "title": "Enable Adaptive Learning",
+      "description": "Whether the adaptive learning module is enabled. In production, all recommended parameters must pass shadow-mode validation before taking effect.",
+      "default": true
+    },
+    "update_interval_minutes": {
+      "type": "integer",
+      "title": "Update Interval (minutes)",
+      "description": "Minimum interval between parameter optimizations. Too short leads to overfitting; too long delays responsiveness. Range: 1–1440 (1 day).",
+      "minimum": 1,
+      "maximum": 1440,
+      "default": 60
+    },
+    "min_samples_for_update": {
+      "type": "integer",
+      "title": "Minimum Samples for Update",
+      "description": "Minimum number of closed trades required to trigger an optimization cycle. Optimization is skipped when the sample count is insufficient. Range: 5–10000.",
+      "minimum": 5,
+      "maximum": 10000,
+      "default": 30
+    },
+    "optimization_metric": {
+      "type": "string",
+      "title": "Optimization Metric",
+      "description": "Metric to maximize during optimization. Different metrics suit different market regimes; review quarterly.",
+      "minLength": 1,
+      "maxLength": 32,
+      "enum": [
+        "calmar_ratio",
+        "sharpe_ratio",
+        "profit_factor",
+        "sortino_ratio",
+        "omega_ratio"
+      ],
+      "default": "calmar_ratio"
+    },
+    "feature_set": {
+      "type": "array",
+      "title": "Learning Feature Set",
+      "description": "List of state feature names used for learning. At least one feature is required. Each feature must be from the predefined enumeration and duplicates are not allowed. Unknown features are silently ignored by the engine.",
+      "minItems": 1,
+      "maxItems": 20,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "enum": [
+          "z_score_at_entry",
+          "trend_strength_mu",
+          "regime_prob",
+          "sr_distance",
+          "volume_ratio",
+          "large_z",
+          "bayesian_score",
+          "time_in_trend",
+          "realized_volatility",
+          "spread",
+          "order_book_imbalance",
+          "funding_rate",
+          "open_interest"
+        ]
+      },
+      "default": [
+        "z_score_at_entry",
+        "trend_strength_mu",
+        "regime_prob",
+        "sr_distance",
+        "volume_ratio",
+        "large_z",
+        "bayesian_score",
+        "time_in_trend"
+      ]
+    },
+    "parameter_bounds": {
+      "type": "object",
+      "title": "Parameter Search Bounds",
+      "description": "Search intervals for strategy parameters. Each parameter is a two-element array [lower, upper] with lower < upper (enforced by the application).",
+      "unevaluatedProperties": false,
+      "propertyNames": {
+        "enum": [
+          "stop_loss_atr_mult",
+          "stop_angle_decay",
+          "breakeven_trigger_risk_mult",
+          "add_profit_atr_mult",
+          "entry_bayesian_threshold",
+          "trend_strength_entry_threshold"
+        ]
+      },
+      "properties": {
+        "stop_loss_atr_mult": {
+          "type": "array",
+          "title": "Stop-Loss ATR Multiplier",
+          "description": "Search range for the stop-loss ATR multiplier. Both bounds must be positive and lower < upper.",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            { "type": "number", "exclusiveMinimum": 0, "maximum": 10, "title": "Lower bound" },
+            { "type": "number", "exclusiveMinimum": 0, "maximum": 10, "title": "Upper bound" }
+          ],
+          "items": false,
+          "default": [1.0, 3.5]
+        },
+        "stop_angle_decay": {
+          "type": "array",
+          "title": "Stop-Loss Angle Decay Coefficient",
+          "description": "Search range for the stop-loss angle decay coefficient. Domain [0, 1].",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            { "type": "number", "minimum": 0, "maximum": 1, "title": "Lower bound" },
+            { "type": "number", "minimum": 0, "maximum": 1, "title": "Upper bound" }
+          ],
+          "items": false,
+          "default": [0.05, 0.3]
+        },
+        "breakeven_trigger_risk_mult": {
+          "type": "array",
+          "title": "Breakeven Trigger Risk Multiplier",
+          "description": "Search range for the breakeven trigger risk multiplier.",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            { "type": "number", "minimum": 0, "maximum": 10, "title": "Lower bound" },
+            { "type": "number", "minimum": 0, "maximum": 10, "title": "Upper bound" }
+          ],
+          "items": false,
+          "default": [1.5, 3.0]
+        },
+        "add_profit_atr_mult": {
+          "type": "array",
+          "title": "Add-Order Profit ATR Threshold",
+          "description": "Search range for the add-order profit ATR threshold.",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            { "type": "number", "minimum": 0, "maximum": 10, "title": "Lower bound" },
+            { "type": "number", "minimum": 0, "maximum": 10, "title": "Upper bound" }
+          ],
+          "items": false,
+          "default": [1.0, 3.0]
+        },
+        "entry_bayesian_threshold": {
+          "type": "array",
+          "title": "Entry Bayesian Score Threshold",
+          "description": "Search range for the entry Bayesian score threshold. Domain [0, 1].",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            { "type": "number", "minimum": 0, "maximum": 1, "title": "Lower bound" },
+            { "type": "number", "minimum": 0, "maximum": 1, "title": "Upper bound" }
+          ],
+          "items": false,
+          "default": [0.55, 0.8]
+        },
+        "trend_strength_entry_threshold": {
+          "type": "array",
+          "title": "Trend Strength Entry Threshold",
+          "description": "Search range for the trend strength entry threshold.",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            { "type": "number", "minimum": 0, "maximum": 5, "title": "Lower bound" },
+            { "type": "number", "minimum": 0, "maximum": 5, "title": "Upper bound" }
+          ],
+          "items": false,
+          "default": [0.1, 0.5]
+        }
+      },
+      "required": [
+        "stop_loss_atr_mult",
+        "stop_angle_decay",
+        "breakeven_trigger_risk_mult",
+        "add_profit_atr_mult",
+        "entry_bayesian_threshold",
+        "trend_strength_entry_threshold"
+      ]
+    },
+    "optimization": {
+      "type": "object",
+      "title": "Optimizer Configuration",
+      "description": "Optimization algorithm and hyper-parameter settings. Required parameters vary by method.",
+      "unevaluatedProperties": false,
+      "propertyNames": {
+        "enum": [
+          "method",
+          "population_size",
+          "sigma",
+          "max_iterations",
+          "random_search_trials",
+          "evaluation_timeout_sec",
+          "canary_sharpe_improvement",
+          "canary_p_value_threshold",
+          "param_change_limit"
+        ]
+      },
+      "properties": {
+        "method": {
+          "type": "string",
+          "title": "Optimization Method",
+          "description": "Algorithm used for optimization. 'cma_es' is the Covariance Matrix Adaptation Evolution Strategy; 'random_search' is the fallback.",
+          "minLength": 1,
+          "maxLength": 32,
+          "enum": ["cma_es", "random_search"],
+          "default": "cma_es"
+        },
+        "population_size": {
+          "type": "integer",
+          "title": "Population Size",
+          "description": "Number of candidate solutions per generation. Required when method is 'cma_es'. Must be at least 4, and typical values are 10-50.",
+          "minimum": 4,
+          "maximum": 200,
+          "default": 20
+        },
+        "sigma": {
+          "type": "number",
+          "title": "Initial Step Size",
+          "description": "Initial step size for CMA-ES. Required when method is 'cma_es'. Typical values: 0.01–0.5.",
+          "exclusiveMinimum": 0,
+          "maximum": 1.0,
+          "default": 0.1
+        },
+        "max_iterations": {
+          "type": "integer",
+          "title": "Maximum Iterations",
+          "description": "Maximum number of iterations per update cycle. Keep this low for real-time performance.",
+          "minimum": 1,
+          "maximum": 50,
+          "default": 5
+        },
+        "random_search_trials": {
+          "type": "integer",
+          "title": "Random Search Trials",
+          "description": "Number of trials for the random search fallback. Required when method is 'random_search'.",
+          "minimum": 10,
+          "maximum": 10000,
+          "default": 200
+        },
+        "evaluation_timeout_sec": {
+          "type": "number",
+          "title": "Evaluation Timeout (seconds)",
+          "description": "Maximum time allowed for a single parameter evaluation. Must be positive. Adjust based on backtest engine performance.",
+          "exclusiveMinimum": 0,
+          "maximum": 600,
+          "default": 60.0
+        },
+        "canary_sharpe_improvement": {
+          "type": "number",
+          "title": "Canary Sharpe Improvement Threshold",
+          "description": "Minimum Sharpe ratio improvement required in shadow mode before new parameters are applied. Set to 0 to accept any improvement.",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.01
+        },
+        "canary_p_value_threshold": {
+          "type": "number",
+          "title": "Canary p-value Threshold",
+          "description": "Statistical significance threshold (p-value) used in shadow mode hypothesis testing. Lower values mean stricter significance.",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.10
+        },
+        "param_change_limit": {
+          "type": "number",
+          "title": "Parameter Change Limit",
+          "description": "Maximum allowed fractional change of a parameter per update to prevent abrupt strategy shifts. 0 means no change allowed, 1 means unlimited.",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.15
+        }
+      },
+      "required": ["method", "max_iterations"],
+      "allOf": [
+        {
+          "if": {
+            "properties": { "method": { "const": "cma_es" } }
+          },
+          "then": {
+            "required": ["population_size", "sigma"]
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "random_search" } }
+          },
+          "then": {
+            "required": ["random_search_trials"]
+          }
+        }
+      ],
+      "dependentRequired": {
+        "canary_sharpe_improvement": ["canary_p_value_threshold"],
+        "canary_p_value_threshold": ["canary_sharpe_improvement"]
+      }
+    }
+  },
+  "required": ["schema_version", "parameter_bounds", "optimization"],
+  "if": {
+    "not": {
+      "properties": {
+        "enabled": { "const": false }
+      }
+    }
+  },
+  "then": {
+    "required": ["update_interval_minutes", "min_samples_for_update", "optimization_metric", "feature_set"]
+  },
+  "$defs": {
+    "paramBound": {
+      "type": "array",
+      "title": "Parameter Search Interval (Generic Template)",
+      "description": "A two-element array [lower, upper] defining the search range for a numeric parameter. Lower must be strictly less than upper (validated by the application). This definition is for documentation purposes; actual bounds are defined per parameter.",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        { "type": "number", "title": "Lower bound" },
+        { "type": "number", "title": "Upper bound" }
+      ],
+      "items": false
+    }
+  },
+  "examples": [
+    {
+      "schema_version": "1.0.0",
+      "enabled": true,
+      "update_interval_minutes": 60,
+      "min_samples_for_update": 30,
+      "optimization_metric": "calmar_ratio",
+      "feature_set": [
+        "z_score_at_entry",
+        "trend_strength_mu",
+        "regime_prob",
+        "sr_distance",
+        "volume_ratio",
+        "large_z",
+        "bayesian_score",
+        "time_in_trend"
+      ],
+      "parameter_bounds": {
+        "stop_loss_atr_mult": [1.0, 3.5],
+        "stop_angle_decay": [0.05, 0.3],
+        "breakeven_trigger_risk_mult": [1.5, 3.0],
+        "add_profit_atr_mult": [1.0, 3.0],
+        "entry_bayesian_threshold": [0.55, 0.8],
+        "trend_strength_entry_threshold": [0.1, 0.5]
+      },
+      "optimization": {
+        "method": "cma_es",
+        "population_size": 20,
+        "sigma": 0.1,
+        "max_iterations": 5,
+        "evaluation_timeout_sec": 60.0,
+        "canary_sharpe_improvement": 0.01,
+        "canary_p_value_threshold": 0.10,
+        "param_change_limit": 0.15
+      }
+    },
+    {
+      "schema_version": "1.0.0",
+      "enabled": false,
+      "parameter_bounds": {
+        "stop_loss_atr_mult": [1.0, 3.5],
+        "stop_angle_decay": [0.05, 0.3],
+        "breakeven_trigger_risk_mult": [1.5, 3.0],
+        "add_profit_atr_mult": [1.0, 3.0],
+        "entry_bayesian_threshold": [0.55, 0.8],
+        "trend_strength_entry_threshold": [0.1, 0.5]
+      },
+      "optimization": {
+        "method": "random_search",
+        "max_iterations": 5,
+        "random_search_trials": 200
+      }
+    }
+  ]
+}
