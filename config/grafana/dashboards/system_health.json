@@ -1,0 +1,699 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "target": {
+          "limit": 100,
+          "matchAny": false,
+          "tags": [],
+          "type": "dashboard"
+        },
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "火种量化交易系统 - 系统健康监控仪表板 (机构级 v8.0)。基于已暴露的 Prometheus 指标构建，涵盖资源、服务、风险、策略、执行与事件总线。所有面板均引用真实指标，未实现指标以占位说明。",
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "doc",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": true,
+      "title": "运行手册",
+      "tooltip": "火种系统运维文档",
+      "type": "link",
+      "url": "https://docs.spark.internal/runbook"
+    }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 99,
+      "panels": [],
+      "title": "📊 系统概览",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "#EAB839", "value": 70},
+              {"color": "red", "value": 90}
+            ]
+          },
+          "unit": "percent"
+        }
+      },
+      "gridPos": {"h": 6, "w": 4, "x": 0, "y": 1},
+      "id": 101,
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [{"expr": "system_cpu_percent", "refId": "A"}],
+      "title": "CPU",
+      "type": "gauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "#EAB839", "value": 75},
+              {"color": "red", "value": 95}
+            ]
+          },
+          "unit": "percent"
+        }
+      },
+      "gridPos": {"h": 6, "w": 4, "x": 4, "y": 1},
+      "id": 102,
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [{"expr": "system_memory_percent", "refId": "A"}],
+      "title": "内存",
+      "type": "gauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "#EAB839", "value": 80},
+              {"color": "red", "value": 95}
+            ]
+          },
+          "unit": "percent"
+        }
+      },
+      "gridPos": {"h": 6, "w": 4, "x": 8, "y": 1},
+      "id": 103,
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [{"expr": "system_disk_percent", "refId": "A"}],
+      "title": "磁盘",
+      "type": "gauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "#EAB839", "value": 10000000000},
+              {"color": "red", "value": 5000000000}
+            ]
+          },
+          "unit": "bytes"
+        }
+      },
+      "gridPos": {"h": 6, "w": 4, "x": 12, "y": 1},
+      "id": 104,
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [{"expr": "node_filesystem_avail_bytes{mountpoint='/'}", "refId": "A"}],
+      "title": "磁盘可用 (需node_exporter)",
+      "type": "gauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "#EAB839", "value": 2000},
+              {"color": "red", "value": 5000}
+            ]
+          },
+          "unit": "none"
+        }
+      },
+      "gridPos": {"h": 6, "w": 4, "x": 16, "y": 1},
+      "id": 105,
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [{"expr": "system_fd_percent", "refId": "A"}],
+      "title": "FD使用率",
+      "type": "gauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {"group": "A", "mode": "none"},
+            "thresholdsStyle": {"mode": "off"}
+          },
+          "mappings": [],
+          "unit": "percent"
+        }
+      },
+      "gridPos": {"h": 8, "w": 4, "x": 20, "y": 1},
+      "id": 106,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom"}},
+      "targets": [{"expr": "system_cpu_percent", "legendFormat": "CPU", "refId": "A"}],
+      "title": "CPU趋势",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 7},
+      "id": 200,
+      "panels": [],
+      "title": "🛡️ 风险与权益",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "unit": "currencyUSD"
+        }
+      },
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 8},
+      "id": 201,
+      "options": {"legend": {"displayMode": "table", "placement": "right"}},
+      "targets": [
+        {"expr": "risk_budget_equity", "legendFormat": "权益", "refId": "A"},
+        {"expr": "total_pnl{symbol=\"all\"}", "legendFormat": "总盈亏", "refId": "B"}
+      ],
+      "title": "净值与盈亏",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "spanNulls": true}
+        }
+      },
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 8},
+      "id": 202,
+      "options": {"legend": {"displayMode": "table", "placement": "right"}},
+      "targets": [
+        {"expr": "risk_budget_max_exposure", "legendFormat": "最大敞口", "refId": "A"},
+        {"expr": "risk_budget_total_exposure", "legendFormat": "当前敞口", "refId": "B"},
+        {"expr": "risk_budget_leverage", "legendFormat": "杠杆", "refId": "C"}
+      ],
+      "title": "风险敞口与杠杆",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"drawStyle": "line", "lineWidth": 2, "spanNulls": true},
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 18},
+      "id": 203,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"expr": "risk_budget_var_95", "legendFormat": "VaR 95%", "refId": "A"},
+        {"expr": "risk_budget_es_95", "legendFormat": "ES 95%", "refId": "B"}
+      ],
+      "title": "尾部风险 (VaR / ES %权益)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"drawStyle": "line", "lineWidth": 2, "spanNulls": true},
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 18},
+      "id": 205,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"expr": "risk_budget_volatility", "legendFormat": "年化波动率", "refId": "A"}
+      ],
+      "title": "波动率",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"drawStyle": "line", "lineWidth": 2, "spanNulls": true},
+          "unit": "ops"
+        }
+      },
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 18},
+      "id": 206,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"expr": "sum(rate(risk_alert_total[5m]))", "legendFormat": "告警速率", "refId": "A"}
+      ],
+      "title": "风控告警频率",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 26},
+      "id": 300,
+      "panels": [],
+      "title": "⚙️ 策略引擎",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"options": {"0": {"text": "震荡"}, "1": {"text": "发散"}, "2": {"text": "回归"}, "3": {"text": "恢复"}}, "type": "value"}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+          "unit": "none"
+        }
+      },
+      "gridPos": {"h": 6, "w": 4, "x": 0, "y": 27},
+      "id": 301,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "orientation": "auto",
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""},
+        "textMode": "auto"
+      },
+      "targets": [{"expr": "max(trend_state_current) by (state)", "legendFormat": "{{state}}", "refId": "A"}],
+      "title": "趋势状态",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {"unit": "short", "custom": {"drawStyle": "line", "lineWidth": 2, "spanNulls": true}}
+      },
+      "gridPos": {"h": 6, "w": 4, "x": 4, "y": 27},
+      "id": 302,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"expr": "tuner_best_objective", "legendFormat": "最佳目标", "refId": "A"}],
+      "title": "参数优化目标",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {"unit": "short", "custom": {"drawStyle": "line", "lineWidth": 2, "spanNulls": true}}
+      },
+      "gridPos": {"h": 6, "w": 4, "x": 8, "y": 27},
+      "id": 303,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"expr": "rate(particle_filter_resample_total[10m])", "legendFormat": "重采样率", "refId": "A"},
+        {"expr": "model_drift_kl", "legendFormat": "KL散度", "refId": "B"}
+      ],
+      "title": "模型健康",
+      "type": "timeseries"
+    },
+    {
+      "datasource": null,
+      "gridPos": {"h": 6, "w": 4, "x": 12, "y": 27},
+      "id": 304,
+      "options": {
+        "content": "<div style=\"text-align: center; padding-top: 20px;\"><h4>贝叶斯得分</h4><p>待集成 GPClassifier 后实现</p></div>",
+        "mode": "html"
+      },
+      "title": "贝叶斯得分（待实现）",
+      "type": "text"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {"unit": "short", "custom": {"drawStyle": "line", "lineWidth": 2, "spanNulls": true}}
+      },
+      "gridPos": {"h": 6, "w": 4, "x": 16, "y": 27},
+      "id": 305,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"expr": "add_order_size", "legendFormat": "加仓大小", "refId": "A"}
+      ],
+      "title": "加仓规模",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {"unit": "ops", "custom": {"drawStyle": "line", "lineWidth": 2, "spanNulls": true}}
+      },
+      "gridPos": {"h": 6, "w": 4, "x": 20, "y": 27},
+      "id": 306,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"expr": "rate(add_order_triggered_total[5m])", "legendFormat": "加仓触发速率", "refId": "A"},
+        {"expr": "rate(tuner_params_applied_total[5m])", "legendFormat": "参数应用速率", "refId": "B"}
+      ],
+      "title": "策略行动速率",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 33},
+      "id": 400,
+      "panels": [],
+      "title": "📈 订单与执行",
+      "type": "row"
+    },
+    {
+      "datasource": null,
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 34},
+      "id": 401,
+      "options": {
+        "content": "<div style=\"text-align: center; padding-top: 20px;\"><h4>订单延迟</h4><p>待实现 order_latency_seconds 直方图</p></div>",
+        "mode": "html"
+      },
+      "title": "订单延迟（待实现）",
+      "type": "text"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"options": {"0": {"text": "正常"}, "1": {"text": "告警"}}, "type": "value"}
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 0.1}
+            ]
+          },
+          "unit": "none"
+        }
+      },
+      "gridPos": {"h": 6, "w": 4, "x": 8, "y": 34},
+      "id": 403,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "orientation": "auto",
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}
+      },
+      "targets": [{"expr": "sum(rate(risk_alert_total[5m])) > 0", "refId": "A"}],
+      "title": "风控告警",
+      "type": "stat"
+    },
+    {
+      "datasource": null,
+      "gridPos": {"h": 6, "w": 4, "x": 12, "y": 34},
+      "id": 404,
+      "options": {
+        "content": "<div style=\"text-align: center; padding-top: 20px;\"><h4>熔断状态</h4><p>待集成 RiskManager 事件</p></div>",
+        "mode": "html"
+      },
+      "title": "熔断（待实现）",
+      "type": "text"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 40},
+      "id": 500,
+      "panels": [],
+      "title": "🌐 数据与连接",
+      "type": "row"
+    },
+    {
+      "datasource": null,
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 41},
+      "id": 501,
+      "options": {
+        "content": "<div style=\"text-align: center; padding-top: 20px;\"><h4>交易所延迟</h4><p>待实现 ws_latency_seconds / rest_latency_seconds</p></div>",
+        "mode": "html"
+      },
+      "title": "交易所延迟（待实现）",
+      "type": "text"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {"unit": "short", "custom": {"drawStyle": "line", "lineWidth": 2, "spanNulls": true}}
+      },
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 41},
+      "id": 502,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"expr": "sum(rate(event_bus_dropped_total[5m]))", "legendFormat": "事件丢弃率", "refId": "A"}
+      ],
+      "title": "事件丢弃率",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{"options": {"0": {"text": "断开"}, "1": {"text": "连接"}}, "type": "value"}],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]},
+          "unit": "none"
+        }
+      },
+      "gridPos": {"h": 6, "w": 4, "x": 16, "y": 41},
+      "id": 503,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "orientation": "auto",
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}
+      },
+      "targets": [{"expr": "service_event_bus_ok", "refId": "A"}],
+      "title": "事件总线",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{"options": {"0": {"text": "DOWN"}, "1": {"text": "UP"}}, "type": "value"}],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]},
+          "unit": "none"
+        }
+      },
+      "gridPos": {"h": 6, "w": 4, "x": 20, "y": 41},
+      "id": 504,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "orientation": "auto",
+        "reduceOptions": {"values": false, "calcs": ["lastNotNull"], "fields": ""}
+      },
+      "targets": [{"expr": "service_redis_ok", "refId": "A"}],
+      "title": "Redis",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 47},
+      "id": 600,
+      "panels": [],
+      "title": "🔄 事件总线与中间件",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {"unit": "ops", "custom": {"drawStyle": "line", "lineWidth": 2, "spanNulls": true}}
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 48},
+      "id": 601,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"expr": "sum(rate(event_bus_published_total[1m]))", "legendFormat": "发布", "refId": "A"},
+        {"expr": "sum(rate(event_bus_dispatched_total[1m]))", "legendFormat": "分发", "refId": "B"}
+      ],
+      "title": "事件总线吞吐量",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {
+        "defaults": {"unit": "short", "custom": {"drawStyle": "line", "lineWidth": 2, "spanNulls": true}}
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 48},
+      "id": 602,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {"expr": "event_bus_backlog", "legendFormat": "积压", "refId": "A"},
+        {"expr": "sum(rate(event_bus_dropped_total[1m]))", "legendFormat": "丢弃率", "refId": "B"}
+      ],
+      "title": "积压与丢弃",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 56},
+      "id": 700,
+      "panels": [],
+      "title": "🗄️ 存储与审计",
+      "type": "row"
+    },
+    {
+      "datasource": null,
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 57},
+      "id": 701,
+      "options": {
+        "content": "<div style=\"text-align: center; padding-top: 20px;\"><h4>Redis内存</h4><p>需部署 Redis Exporter</p></div>",
+        "mode": "html"
+      },
+      "title": "Redis内存（需 Exporter）",
+      "type": "text"
+    },
+    {
+      "datasource": null,
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 57},
+      "id": 702,
+      "options": {
+        "content": "<div style=\"text-align: center; padding-top: 20px;\"><h4>SQLite大小</h4><p>待实现 sqlite_db_size_bytes 指标</p></div>",
+        "mode": "html"
+      },
+      "title": "SQLite大小（待实现）",
+      "type": "text"
+    },
+    {
+      "datasource": null,
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 57},
+      "id": 703,
+      "options": {
+        "content": "<div style=\"text-align: center; padding-top: 20px;\"><h4>审计日志</h4><p>待实现 AuditLogger 指标</p></div>",
+        "mode": "html"
+      },
+      "title": "审计日志（待实现）",
+      "type": "text"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 63},
+      "id": 800,
+      "panels": [],
+      "title": "📋 系统信息",
+      "type": "row"
+    },
+    {
+      "datasource": null,
+      "gridPos": {"h": 4, "w": 24, "x": 0, "y": 64},
+      "id": 801,
+      "options": {
+        "content": "<div style=\"text-align: center; font-size: 16px;\">\n  <strong>部署环境：生产/灾备</strong> | 数据源：${DS_PROMETHEUS} | 刷新间隔：10s | 时间范围：${__from} ~ ${__to}\n</div>",
+        "mode": "html"
+      },
+      "title": "系统信息",
+      "type": "text"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 36,
+  "style": "dark",
+  "tags": ["spark", "production", "health", "institutional", "v8.0"],
+  "templating": {
+    "list": [
+      {
+        "current": {"selected": true, "text": "Prometheus", "value": "Prometheus"},
+        "hide": 0,
+        "includeAll": false,
+        "label": "数据源",
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-12h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h"],
+    "time_options": ["5m", "15m", "1h", "6h", "12h", "24h", "2d", "7d", "30d"]
+  },
+  "timezone": "utc",
+  "title": "🔥 火种系统健康监控 v8.0",
+  "uid": "spark-system-health-v8",
+  "version": 1,
+  "weekStart": ""
+    }
