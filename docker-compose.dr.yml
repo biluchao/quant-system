@@ -1,0 +1,375 @@
+version: '2.4'
+
+# =============================================================================
+# 火种量化交易系统 - 灾备环境 Docker Compose 配置 v14.0.0
+# =============================================================================
+# 用途: 当主环境不可用时，快速启动最小化核心服务，恢复交易能力。
+# 要求: 主机内核 >= 4.18，Docker >= 20.10，docker-compose >= 1.29 (v2.4 支持)
+# 注意: 本文件采用 Compose v2.4 格式，以启用 depends_on condition、
+#       healthcheck、resource limits 等关键生产特性。单机部署开箱即用。
+# 使用前:
+#   1. 创建 secrets 目录 (权限 700) 并在其中生成所有密钥文件 (权限 600)
+#   2. 生成方法见文件末尾注释
+#   3. 创建 .env.dr 文件 (参考 .env.dr.example)，设置强密码
+#   4. 预先创建主机目录 /data/spark/dr/{redis,engine_logs,gateway_logs,sqlite}
+#   5. 以 init profile 运行一次:
+#      docker-compose -f docker-compose.dr.yml --env-file .env.dr --profile init up
+#   6. 启动核心服务:
+#      docker-compose -f docker-compose.dr.yml --env-file .env.dr up -d
+#   7. 确认服务健康: docker-compose -f docker-compose.dr.yml ps
+# =============================================================================
+
+x-logging: &logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "15"
+    compress: "true"
+    max-buffer-size: "1m"
+    tag: "spark-dr"
+    labels: "environment,production,component,spark"
+
+x-healthcheck-defaults: &healthcheck_defaults
+  interval: 15s
+  timeout: 10s
+  retries: 3
+  start_period: 180s
+
+x-ulimits: &ulimits
+  nofile:
+    soft: 65536
+    hard: 65536
+  nproc:
+    soft: 8192
+    hard: 8192
+
+services:
+  # ---------------------------------------------------------------------------
+  # Redis - 状态缓存与事件总线后端
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: spark-dr-redis
+    restart: on-failure:5
+    logging: *logging
+    user: "redis"
+    command:
+      - redis-server
+      - --appendonly yes
+      - --appendfsync everysec
+      - --maxmemory 384mb
+      - --maxmemory-policy allkeys-lru
+      - --maxmemory-samples 5
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      - --save 60 1
+      - --save 300 10
+      - --rename-command CONFIG ""
+      - --rename-command DEBUG ""
+      - --rename-command FLUSHDB ""
+      - --rename-command FLUSHALL ""
+      - --bind 0.0.0.0
+      - --protected-mode yes
+      - --loglevel notice
+      - --slowlog-log-slower-than 10000
+      - --slowlog-max-len 128
+      - --maxclients 2000
+      - --tcp-keepalive 300
+      - --lazyfree-lazy-eviction yes
+      - --lazyfree-lazy-expire yes
+      - --tcp-backlog 511
+      - --unixsocket /var/run/redis/redis.sock
+      - --unixsocketperm 660
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - dr_redis_data:/data:nodev,noexec,nosuid
+      - dr_redis_socket:/var/run/redis
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - /etc/localtime:/etc/localtime:ro
+    tmpfs:
+      - /tmp:exec,mode=1777,size=64m
+    healthcheck:
+      test: ["CMD", "redis-cli", "-s", "/var/run/redis/redis.sock", "--no-auth-warning", "ping"]
+      <<: *healthcheck_defaults
+      interval: 10s
+    networks:
+      spark-dr-net:
+        ipv4_address: 10.100.0.2
+    environment:
+      - TZ=UTC
+      - REDISCLI_AUTH=${REDIS_PASSWORD}
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    mem_limit: 512M
+    mem_reservation: 256M
+    cpu_shares: 307
+    cpu_quota: 80000
+    stop_grace_period: 30s
+    sysctls:
+      net.core.somaxconn: 1024
+      vm.overcommit_memory: 1
+      net.ipv4.tcp_tw_reuse: 1
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETGID
+      - SETUID
+      - CHOWN
+      - DAC_OVERRIDE
+
+  # ---------------------------------------------------------------------------
+  # 策略引擎 - 核心决策模块
+  # ---------------------------------------------------------------------------
+  engine:
+    image: spark-engine:latest
+    container_name: spark-dr-engine
+    restart: on-failure:5
+    logging: *logging
+    depends_on:
+      redis:
+        condition: service_healthy
+    user: "1000:1000"
+    volumes:
+      - ./config:/app/config:ro
+      - dr_engine_logs:/app/logs
+      - dr_sqlite_data:/app/data
+      - /etc/localtime:/etc/localtime:ro
+      # 密钥文件挂载 (替代 Docker secrets)
+      - ./secrets/binance_api_key.txt:/run/secrets/binance_api_key:ro
+      - ./secrets/binance_api_secret.txt:/run/secrets/binance_api_secret:ro
+      - ./secrets/audit_hmac_key.txt:/run/secrets/audit_hmac_key:ro
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - DEPLOY_ENV=dr
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - PROMETHEUS_PORT=0
+      - VAULT_ADDR=${VAULT_ADDR:-}
+      - VAULT_TOKEN=${VAULT_TOKEN:-}
+      - BINANCE_API_KEY_FILE=/run/secrets/binance_api_key
+      - BINANCE_API_SECRET_FILE=/run/secrets/binance_api_secret
+      - AUDIT_HMAC_KEY_FILE=/run/secrets/audit_hmac_key
+      - STATE_RECOVERY_MODE=dr
+      - TZ=UTC
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"from core.health_monitor import HealthMonitor; r=HealthMonitor().check(); raise SystemExit(0 if isinstance(r,dict) and r.get('status')=='ok' else 1)\""]
+      <<: *healthcheck_defaults
+      start_period: 300s
+    networks:
+      spark-dr-net:
+        ipv4_address: 10.100.0.3
+    mem_limit: 4608M
+    mem_reservation: 2560M
+    cpu_shares: 1536
+    cpu_quota: 250000
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    tmpfs:
+      - /tmp:exec,mode=1777,size=256m
+      - /var/tmp:exec,mode=1777,size=256m
+    ulimits: *ulimits
+    stop_grace_period: 120s
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_NICE
+
+  # ---------------------------------------------------------------------------
+  # 网关 - 市场数据接入与订单执行
+  # ---------------------------------------------------------------------------
+  gateway:
+    image: spark-gateway:latest
+    container_name: spark-dr-gateway
+    restart: on-failure:5
+    logging: *logging
+    depends_on:
+      engine:
+        condition: service_healthy
+    user: "1000:1000"
+    volumes:
+      - ./config:/app/config:ro
+      - dr_gateway_logs:/app/logs
+      - /etc/localtime:/etc/localtime:ro
+      - ./secrets/binance_api_key.txt:/run/secrets/binance_api_key:ro
+      - ./secrets/binance_api_secret.txt:/run/secrets/binance_api_secret:ro
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - ENGINE_HOST=engine
+      - DEPLOY_ENV=dr
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - VAULT_ADDR=${VAULT_ADDR:-}
+      - VAULT_TOKEN=${VAULT_TOKEN:-}
+      - BINANCE_API_KEY_FILE=/run/secrets/binance_api_key
+      - BINANCE_API_SECRET_FILE=/run/secrets/binance_api_secret
+      - TZ=UTC
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"from gateway.health import check; r=check(); raise SystemExit(0 if isinstance(r,dict) and r.get('status')=='ok' else 1)\""]
+      <<: *healthcheck_defaults
+      start_period: 90s
+    networks:
+      spark-dr-net:
+        ipv4_address: 10.100.0.4
+    mem_limit: 1280M
+    mem_reservation: 640M
+    cpu_shares: 768
+    cpu_quota: 120000
+    security_opt:
+      - no-new-privileges:true
+    read_only: false
+    tmpfs:
+      - /tmp:exec,mode=1777,size=128m
+    ulimits: *ulimits
+    stop_grace_period: 60s
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_NICE
+
+  # ---------------------------------------------------------------------------
+  # 前端仪表板（可选） - 仅灾备监控时使用
+  # ---------------------------------------------------------------------------
+  frontend:
+    image: spark-frontend:latest
+    container_name: spark-dr-frontend
+    restart: unless-stopped
+    logging: *logging
+    profiles:
+      - monitoring
+    depends_on:
+      engine:
+        condition: service_healthy
+    user: "1000:1000"
+    volumes:
+      - ./frontend/config:/app/config:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ./secrets/frontend.crt:/run/secrets/frontend_cert:ro
+      - ./secrets/frontend.key:/run/secrets/frontend_key:ro
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - DEPLOY_ENV=dr
+      - TLS_CERT_PATH=/run/secrets/frontend_cert
+      - TLS_KEY_PATH=/run/secrets/frontend_key
+      - AUTH_USERNAME=${FRONTEND_USERNAME:-admin}
+      - AUTH_PASSWORD_HASH=${FRONTEND_PASSWORD_HASH:?FRONTEND_PASSWORD_HASH is required}
+      - LOG_LEVEL=${LOG_LEVEL:-WARNING}
+      - TZ=UTC
+    ports:
+      - "127.0.0.1:443:443"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--connect-timeout", "5", "--max-time", "10", "-k", "https://localhost/health"]
+      <<: *healthcheck_defaults
+      interval: 30s
+    networks:
+      spark-dr-net:
+        ipv4_address: 10.100.0.5
+    mem_limit: 512M
+    mem_reservation: 256M
+    cpu_shares: 384
+    cpu_quota: 60000
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:exec,mode=1777,size=32m
+    stop_grace_period: 15s
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+  # ---------------------------------------------------------------------------
+  # 初始化服务 - 创建必要目录（仅运行一次，使用 --profile init 启动）
+  # ---------------------------------------------------------------------------
+  init:
+    image: alpine:latest
+    container_name: spark-dr-init
+    entrypoint: ["/bin/sh", "-c"]
+    user: root
+    command:
+      - |
+        set -e
+        echo "==> 开始灾备环境初始化..."
+        install -d -m 700 -o 1000 -g 1000 /data/spark/dr/redis
+        install -d -m 755 -o 1000 -g 1000 /data/spark/dr/engine_logs
+        install -d -m 755 -o 1000 -g 1000 /data/spark/dr/gateway_logs
+        install -d -m 755 -o 1000 -g 1000 /data/spark/dr/sqlite
+        echo "==> 初始化完成"
+    volumes:
+      - dr_redis_data:/data/spark/dr/redis
+      - dr_engine_logs:/data/spark/dr/engine_logs
+      - dr_gateway_logs:/data/spark/dr/gateway_logs
+      - dr_sqlite_data:/data/spark/dr/sqlite
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - spark-dr-net
+    profiles:
+      - init
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE
+      - CHOWN
+      - FOWNER
+
+# -----------------------------------------------------------------------------
+# 密钥文件 (需预先在 ./secrets/ 下创建并设置权限 600)
+# 生成示例:
+#   mkdir -p secrets && chmod 700 secrets
+#   openssl rand -hex 32 > secrets/binance_api_key.txt
+#   openssl rand -hex 32 > secrets/binance_api_secret.txt
+#   openssl rand -hex 64 > secrets/audit_hmac_key.txt
+#   openssl req -x509 -newkey rsa:4096 -keyout secrets/frontend.key \
+#     -out secrets/frontend.crt -days 365 -nodes -subj "/CN=localhost"
+# -----------------------------------------------------------------------------
+
+volumes:
+  dr_redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      device: /data/spark/dr/redis
+      o: bind,nodev,noexec,nosuid
+  dr_redis_socket:
+    driver: local
+  dr_engine_logs:
+    driver: local
+    driver_opts:
+      type: none
+      device: /data/spark/dr/engine_logs
+      o: bind,nodev,noexec,nosuid
+  dr_gateway_logs:
+    driver: local
+    driver_opts:
+      type: none
+      device: /data/spark/dr/gateway_logs
+      o: bind,nodev,noexec,nosuid
+  dr_sqlite_data:
+    driver: local
+    driver_opts:
+      type: none
+      device: /data/spark/dr/sqlite
+      o: bind,nodev,nosuid
+
+networks:
+  spark-dr-net:
+    driver: bridge
+    internal: false
+    ipam:
+      config:
+        - subnet: 10.100.0.0/24
+          gateway: 10.100.0.1
+    driver_opts:
+      com.docker.network.bridge.name: spark-dr-br0
+      com.docker.network.bridge.enable_icc: "false"
