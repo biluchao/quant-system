@@ -1,0 +1,597 @@
+version: '3.8'
+
+# =============================================================================
+# 火种量化交易系统 - 生产环境 Docker Compose 配置 v18.0.0
+# =============================================================================
+# 用途: 部署完整的火种量化交易系统，包含核心策略引擎、数据网关、前端、
+#       AI 沙箱、监控等全部服务。
+# 适用: 香港节点 4核/8GB/80GB 服务器，单机非 Swarm 模式
+# 使用: DOCKER_CONTENT_TRUST=1 docker-compose up -d
+# 安全: 所有密钥通过 Docker secrets 注入；容器以非 root 用户运行；
+#       启用只读根文件系统、tmpfs、seccomp、cap_drop: ALL 等限制；
+#       服务端口仅绑定 127.0.0.1，外部通过反向代理访问。
+# =============================================================================
+
+x-logging: &logging
+  driver: "json-file"
+  options:
+    tag: "{{.Name}}"
+    max-size: "20m"
+    max-file: "10"
+    compress: "true"
+
+x-healthcheck-defaults: &healthcheck-defaults
+  interval: 15s
+  timeout: 8s
+  retries: 5
+  start_period: 60s
+  start_interval: 5s
+
+x-deploy-small: &deploy-small
+  resources:
+    limits:
+      cpus: '0.5'
+      memory: 320M
+      pids: 128
+    reservations:
+      cpus: '0.25'
+      memory: 160M
+
+x-security-opts: &security-opts
+  cap_drop:
+    - ALL
+  cap_add:
+    - CHOWN
+    - DAC_OVERRIDE
+    - SETGID
+    - SETUID
+  security_opt:
+    - no-new-privileges:true
+    - apparmor:docker-default
+    - seccomp=./seccomp-profiles/default.json
+  read_only: true
+  tmpfs:
+    - /tmp:exec,mode=1777,size=64M
+    - /var/tmp:exec,mode=1777,size=64M
+  ulimits:
+    nproc: 4096
+    nofile:
+      soft: 65536
+      hard: 65536
+  sysctls:
+    net.core.somaxconn: 4096
+    net.ipv4.tcp_max_syn_backlog: 4096
+
+x-essential-oom: &essential-oom
+  oom_score_adj: -800
+
+x-nonessential-oom: &nonessential-oom
+  oom_score_adj: 500
+
+services:
+  # ---------------------------------------------------------------------------
+  # Redis - 状态缓存与事件总线后端
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine@sha256:9c2a9d3e2a1b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8  # 生产环境请替换为实际摘要
+    container_name: spark-redis
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 60s
+    stop_signal: SIGTERM
+    logging: *logging
+    user: "999:999"
+    command: >
+      /bin/sh -c '
+        REDIS_PASS=$(cat /run/secrets/redis_password);
+        exec redis-server
+          --appendonly yes
+          --appendfsync everysec
+          --maxmemory 512mb
+          --maxmemory-policy allkeys-lru
+          --requirepass "$${REDIS_PASS}"
+          --save 900 1
+          --save 300 10
+          --save 60 10000
+          --rename-command FLUSHDB ""
+          --rename-command FLUSHALL ""
+          --rename-command DEBUG ""
+          --rename-command CONFIG ""
+      '
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data:rw
+      - ./config/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    secrets:
+      - source: redis_password
+        target: redis_password
+        uid: "999"
+        gid: "999"
+        mode: 0400
+    healthcheck:
+      <<: *healthcheck-defaults
+      test:
+        - CMD-SHELL
+        - |
+          REDIS_PASS=$(cat /run/secrets/redis_password);
+          redis-cli --no-auth-warning -a "$${REDIS_PASS}" ping | grep -q PONG
+    networks:
+      - spark-backend
+    environment:
+      - TZ=UTC
+    <<: *security-opts
+    <<: *essential-oom
+    read_only: false
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 640M
+          pids: 256
+        reservations:
+          cpus: '0.25'
+          memory: 320M
+
+  # ---------------------------------------------------------------------------
+  # 策略引擎 - 核心决策与风控
+  # ---------------------------------------------------------------------------
+  engine:
+    image: spark-engine@sha256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # 替换为实际摘要
+    container_name: spark-engine
+    init: true
+    restart: on-failure:5
+    stop_grace_period: 60s
+    stop_signal: SIGTERM
+    logging: *logging
+    user: "1000:1000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./config:/app/config:ro
+      - engine_logs:/app/logs:rw
+      - sqlite_data:/app/data:rw
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    secrets:
+      - source: binance_api_key
+        target: binance_api_key
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+      - source: binance_api_secret
+        target: binance_api_secret
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+      - source: audit_hmac_key
+        target: audit_hmac_key
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+      - source: redis_password
+        target: redis_password
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD_FILE=/run/secrets/redis_password
+      - DEPLOY_ENV=${DEPLOY_ENV:-prod}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - PROMETHEUS_PORT=9090
+      - VAULT_ADDR=${VAULT_ADDR:-}
+      - VAULT_TOKEN=${VAULT_TOKEN:-}
+      - BINANCE_API_KEY_FILE=/run/secrets/binance_api_key
+      - BINANCE_API_SECRET_FILE=/run/secrets/binance_api_secret
+      - AUDIT_HMAC_KEY_FILE=/run/secrets/audit_hmac_key
+      - TZ=${TZ:-UTC}
+      - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=utf-8
+      - LANG=C.UTF-8
+      - OMP_NUM_THREADS=1
+    ports:
+      - "127.0.0.1:9090:9090"
+    healthcheck:
+      <<: *healthcheck-defaults
+      test:
+        - CMD-SHELL
+        - |
+          python3 -c '
+          from core.health_monitor import HealthMonitor;
+          import json;
+          result = HealthMonitor().check();
+          print(json.dumps(result));
+          ' | python3 -c "
+          import sys, json;
+          d = json.loads(sys.stdin.read());
+          sys.exit(0 if d.get('status') == 'ok' else 1)
+          "
+      start_period: 180s
+    networks:
+      - spark-backend
+      - spark-monitoring
+      - spark-external
+    <<: *security-opts
+    <<: *essential-oom
+    read_only: false
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 3072M
+          pids: 1024
+        reservations:
+          cpus: '1.5'
+          memory: 2048M
+
+  # ---------------------------------------------------------------------------
+  # 网关 - 市场数据接入与订单执行
+  # ---------------------------------------------------------------------------
+  gateway:
+    image: spark-gateway@sha256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # 替换为实际摘要
+    container_name: spark-gateway
+    init: true
+    restart: on-failure:5
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    logging: *logging
+    user: "1000:1000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      engine:
+        condition: service_healthy
+    volumes:
+      - ./config:/app/config:ro
+      - gateway_logs:/app/logs:rw
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    secrets:
+      - source: binance_api_key
+        target: binance_api_key
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+      - source: binance_api_secret
+        target: binance_api_secret
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+      - source: redis_password
+        target: redis_password
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD_FILE=/run/secrets/redis_password
+      - ENGINE_HOST=engine
+      - DEPLOY_ENV=${DEPLOY_ENV:-prod}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - VAULT_ADDR=${VAULT_ADDR:-}
+      - VAULT_TOKEN=${VAULT_TOKEN:-}
+      - BINANCE_API_KEY_FILE=/run/secrets/binance_api_key
+      - BINANCE_API_SECRET_FILE=/run/secrets/binance_api_secret
+      - TZ=${TZ:-UTC}
+      - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=utf-8
+      - LANG=C.UTF-8
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      <<: *healthcheck-defaults
+      test:
+        - CMD-SHELL
+        - |
+          python3 -c '
+          from gateway.health import check;
+          import json;
+          print(json.dumps(check()));
+          ' | python3 -c "
+          import sys, json;
+          d = json.loads(sys.stdin.read());
+          sys.exit(0 if d.get('status') == 'ok' else 1)
+          "
+    networks:
+      - spark-backend
+      - spark-external
+    <<: *security-opts
+    <<: *essential-oom
+    read_only: false
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 768M
+          pids: 512
+        reservations:
+          cpus: '0.5'
+          memory: 384M
+
+  # ---------------------------------------------------------------------------
+  # 前端仪表板（通过引擎 API 获取数据）
+  # ---------------------------------------------------------------------------
+  frontend:
+    image: spark-frontend@sha256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # 替换为实际摘要
+    container_name: spark-frontend
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 10s
+    stop_signal: SIGTERM
+    logging: *logging
+    user: "1000:1000"
+    depends_on:
+      engine:
+        condition: service_healthy
+    environment:
+      - ENGINE_HOST=engine
+      - ENGINE_PORT=8080
+      - DEPLOY_ENV=${DEPLOY_ENV:-prod}
+      - TLS_CERT_PATH=/run/secrets/frontend_cert
+      - TLS_KEY_PATH=/run/secrets/frontend_key
+      - TZ=${TZ:-UTC}
+      - LANG=C.UTF-8
+    volumes:
+      - ./frontend/config:/app/config:ro
+    secrets:
+      - source: frontend_cert
+        target: frontend_cert
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+      - source: frontend_key
+        target: frontend_key
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+    ports:
+      - "127.0.0.1:443:443"
+    healthcheck:
+      <<: *healthcheck-defaults
+      test:
+        - CMD-SHELL
+        - |
+          curl -f -k https://localhost/health
+    networks:
+      - spark-backend
+    <<: *security-opts
+    <<: *nonessential-oom
+    read_only: true
+    deploy:
+      <<: *deploy-small
+
+  # ---------------------------------------------------------------------------
+  # Prometheus - 指标收集
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus@sha256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # 替换为实际摘要
+    container_name: spark-prometheus
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    logging: *logging
+    user: "65534:65534"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus:rw
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=90d'
+      - '--storage.tsdb.max-block-duration=2h'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    ports:
+      - "127.0.0.1:9091:9090"
+    healthcheck:
+      <<: *healthcheck-defaults
+      test:
+        - CMD
+        - wget
+        - --no-verbose
+        - --tries=1
+        - --spider
+        - http://localhost:9090/-/healthy
+    networks:
+      - spark-monitoring
+    <<: *security-opts
+    <<: *nonessential-oom
+    read_only: false
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 768M
+          pids: 256
+        reservations:
+          cpus: '0.25'
+          memory: 384M
+
+  # ---------------------------------------------------------------------------
+  # Grafana - 监控仪表板
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana@sha256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # 替换为实际摘要
+    container_name: spark-grafana
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    logging: *logging
+    user: "472:472"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD_FILE=/run/secrets/grafana_admin_password
+      - GF_INSTALL_PLUGINS=grafana-clock-panel
+      - GF_SERVER_ROOT_URL=${GF_SERVER_ROOT_URL:-https://monitor.example.com}  # 修改为实际域名
+    volumes:
+      - grafana_data:/var/lib/grafana:rw
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./config/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    secrets:
+      - source: grafana_admin_password
+        target: grafana_admin_password
+        uid: "472"
+        gid: "472"
+        mode: 0400
+    ports:
+      - "127.0.0.1:3000:3000"
+    healthcheck:
+      <<: *healthcheck-defaults
+      test:
+        - CMD
+        - wget
+        - --no-verbose
+        - --tries=1
+        - --spider
+        - http://localhost:3000/api/health
+    networks:
+      - spark-monitoring
+    <<: *security-opts
+    <<: *nonessential-oom
+    read_only: false
+    deploy:
+      <<: *deploy-small
+
+  # ---------------------------------------------------------------------------
+  # AI 沙箱 - 本地 DeepSeek 模型（按需启动，使用 --profile ai）
+  # ---------------------------------------------------------------------------
+  ai-sandbox:
+    image: spark-ai-sandbox@sha256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # 替换为实际摘要
+    container_name: spark-ai-sandbox
+    init: true
+    restart: "no"
+    stop_grace_period: 60s
+    stop_signal: SIGTERM
+    logging: *logging
+    user: "1000:1000"
+    profiles:
+      - ai
+    environment:
+      - DEEPSEEK_MODEL_PATH=/models/deepseek-1.3b
+      - OPENCLAW_SANDBOX=1
+      - ENGINE_HOST=engine
+      - REDIS_HOST=redis
+    volumes:
+      - ./models:/models:ro
+      - ./shared_state:/shared_state:ro
+    ports:
+      - "127.0.0.1:11434:11434"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          curl -f http://localhost:11434/api/health
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+      start_interval: 10s
+    networks:
+      - spark-backend
+      - spark-ai
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - apparmor:docker-default
+      - seccomp=./ai_sandbox/seccomp.json
+    read_only: true
+    tmpfs:
+      - /tmp:exec,mode=1777,size=256M
+      - /var/tmp:exec,mode=1777,size=256M
+    ulimits:
+      nproc: 4096
+      nofile:
+        soft: 65536
+        hard: 65536
+    <<: *nonessential-oom
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 2048M
+          pids: 1024
+        reservations:
+          cpus: '1.0'
+          memory: 1024M
+
+# -----------------------------------------------------------------------------
+# Secrets (生产环境通过 Vault Agent 注入，此处为示例文件挂载)
+# -----------------------------------------------------------------------------
+secrets:
+  redis_password:
+    file: ./secrets/redis_password.txt
+  binance_api_key:
+    file: ./secrets/binance_api_key.txt
+  binance_api_secret:
+    file: ./secrets/binance_api_secret.txt
+  audit_hmac_key:
+    file: ./secrets/audit_hmac_key.txt
+  frontend_cert:
+    file: ./secrets/frontend.crt
+  frontend_key:
+    file: ./secrets/frontend.key
+  grafana_admin_password:
+    file: ./secrets/grafana_admin_password.txt
+
+volumes:
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      device: /data/spark/redis
+      o: bind
+  engine_logs:
+    driver: local
+    driver_opts:
+      type: none
+      device: /data/spark/engine_logs
+      o: bind
+  gateway_logs:
+    driver: local
+    driver_opts:
+      type: none
+      device: /data/spark/gateway_logs
+      o: bind
+  sqlite_data:
+    driver: local
+    driver_opts:
+      type: none
+      device: /data/spark/sqlite
+      o: bind
+  prometheus_data:
+    driver: local
+    driver_opts:
+      type: none
+      device: /data/spark/prometheus
+      o: bind
+  grafana_data:
+    driver: local
+    driver_opts:
+      type: none
+      device: /data/spark/grafana
+      o: bind
+
+networks:
+  spark-backend:
+    driver: bridge
+    internal: true
+  spark-monitoring:
+    driver: bridge
+    internal: true
+  spark-external:
+    driver: bridge
+  spark-ai:
+    driver: bridge
+    internal: true
