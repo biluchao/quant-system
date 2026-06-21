@@ -1,0 +1,485 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://spark-quant.example.com/schemas/strategy.schema.json",
+  "title": "火种量化交易系统 · 策略配置 Schema (v5.0.0)",
+  "description": "定义策略核心参数的结构、类型、取值范围、默认值及跨字段约束。所有默认值与边界均基于万亿美金级账户的极度保守风控原则设定，避免过度交易与极端风险敞口。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "ma",
+    "atr",
+    "five_conditions",
+    "false_breakout",
+    "sr",
+    "position",
+    "bayesian",
+    "stop_loss",
+    "risk",
+    "execution",
+    "learning",
+    "model_hyperparams"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "配置格式版本号，当前固定为 '5.0.0'，用于检测不兼容变更。必须与此文件版本一致。",
+      "const": "5.0.0"
+    },
+    "ma": {
+      "type": "object",
+      "description": "自适应移动均线相关配置。min_length 与 max_length 之间的范围决定了自适应能力的边界，差距过小自适应效果差，过大可能导致滞后严重。",
+      "additionalProperties": false,
+      "required": ["min_length", "max_length", "default_length", "adaptation_smoothing"],
+      "properties": {
+        "min_length": {
+          "type": "integer",
+          "description": "MA 周期最小值（K线根数），必须 ≥ 5 且严格小于 max_length。过小易受噪声干扰，建议 ≥ 10。",
+          "default": 18,
+          "minimum": 5,
+          "maximum": 40
+        },
+        "max_length": {
+          "type": "integer",
+          "description": "MA 周期最大值（K线根数），必须 ≤ 50 且严格大于 min_length。建议与 min_length 差距 ≥ 5。",
+          "default": 34,
+          "minimum": 10,
+          "maximum": 50
+        },
+        "default_length": {
+          "type": "integer",
+          "description": "MA 默认周期（K线根数），应在 [min_length, max_length] 范围内，作为初始值。",
+          "default": 26,
+          "minimum": 5,
+          "maximum": 50
+        },
+        "adaptation_smoothing": {
+          "type": "number",
+          "description": "MA 长度自适应平滑因子，取值范围 [0.05, 1.0]。过小的值会导致频繁抖动，建议 ≥ 0.1。",
+          "default": 0.15,
+          "minimum": 0.05,
+          "maximum": 1.0
+        }
+      }
+    },
+    "atr": {
+      "type": "object",
+      "description": "平均真实波幅配置，用于波动率归一化。",
+      "additionalProperties": false,
+      "required": ["period"],
+      "properties": {
+        "period": {
+          "type": "integer",
+          "description": "ATR 计算周期（K线数），必须为正整数，范围 [5, 50]，推荐 14。",
+          "default": 14,
+          "minimum": 5,
+          "maximum": 50
+        }
+      }
+    },
+    "five_conditions": {
+      "type": "object",
+      "description": "不回归五条件判定参数。所有条件必须同时满足才确认有效突破。",
+      "additionalProperties": false,
+      "required": [
+        "impulse_threshold",
+        "curvature_bars",
+        "escape_velocity_bars",
+        "divergence_bars",
+        "low_freq_energy_ratio"
+      ],
+      "properties": {
+        "impulse_threshold": {
+          "type": "number",
+          "description": "穿越脉冲强度阈值 I，必须 ≥ 1.0。过低易产生噪声信号，建议 2.0-3.0。",
+          "default": 2.5,
+          "minimum": 1.0,
+          "maximum": 10.0
+        },
+        "curvature_bars": {
+          "type": "integer",
+          "description": "曲率确认所需连续K线数，至少 1 根，推荐 2-3。",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 5
+        },
+        "escape_velocity_bars": {
+          "type": "integer",
+          "description": "逃逸速度确认所需连续K线数，至少 1 根。",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 5
+        },
+        "divergence_bars": {
+          "type": "integer",
+          "description": "发散确认所需连续K线数，至少 1 根。",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 5
+        },
+        "low_freq_energy_ratio": {
+          "type": "number",
+          "description": "低频能量占比阈值，取值 [0.5, 0.95]。过高可能导致永不触发，建议 0.7-0.85。",
+          "default": 0.75,
+          "minimum": 0.5,
+          "maximum": 0.95
+        }
+      }
+    },
+    "false_breakout": {
+      "type": "object",
+      "description": "假突破检测与恢复参数，用于避免被短暂毛刺洗出。所有阈值均偏保守，容忍度过大可能将真反转误判为假突破。",
+      "additionalProperties": false,
+      "required": [
+        "tolerance_atr_mult",
+        "recovery_bars",
+        "recovery_confirm_count",
+        "re_entry_coeff",
+        "tight_stop_atr_mult"
+      ],
+      "properties": {
+        "tolerance_atr_mult": {
+          "type": "number",
+          "description": "假突破容忍带宽度（ATR 倍数），推荐 0.2-0.5。超过此宽度视为真反转。",
+          "default": 0.3,
+          "minimum": 0.1,
+          "maximum": 0.6
+        },
+        "recovery_bars": {
+          "type": "integer",
+          "description": "假突破恢复判定窗口（K线数），必须在此窗口内回到均线上方。",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 5
+        },
+        "recovery_confirm_count": {
+          "type": "integer",
+          "description": "恢复确认所需满足条件数（4选3），即 4 个条件中至少满足此数量。",
+          "default": 3,
+          "minimum": 2,
+          "maximum": 4
+        },
+        "re_entry_coeff": {
+          "type": "number",
+          "description": "假突破恢复后回补仓位比例，不得超过 1.0，保守建议 0.5-0.9。",
+          "default": 0.8,
+          "minimum": 0.3,
+          "maximum": 1.0
+        },
+        "tight_stop_atr_mult": {
+          "type": "number",
+          "description": "恢复后紧止损 ATR 倍数，应小于常规止损，建议 1.0-2.0。",
+          "default": 1.5,
+          "minimum": 0.8,
+          "maximum": 2.5
+        }
+      }
+    },
+    "sr": {
+      "type": "object",
+      "description": "支撑/压力线参数。",
+      "additionalProperties": false,
+      "required": ["merge_threshold_atr", "max_lines", "touch_decay"],
+      "properties": {
+        "merge_threshold_atr": {
+          "type": "number",
+          "description": "S/R 线合并距离阈值（ATR 倍数），小于此距离视为同一线，建议 0.2-0.5。",
+          "default": 0.3,
+          "minimum": 0.05,
+          "maximum": 1.0
+        },
+        "max_lines": {
+          "type": "integer",
+          "description": "最大记录 S/R 线条数，控制内存与复杂度，建议 3-8。",
+          "default": 5,
+          "minimum": 2,
+          "maximum": 10
+        },
+        "touch_decay": {
+          "type": "number",
+          "description": "角色互换时触碰记忆保留比例，0.2-1.0。0.2 表示遗忘80%历史，越低对新价格越敏感。",
+          "default": 0.6,
+          "minimum": 0.2,
+          "maximum": 1.0
+        }
+      }
+    },
+    "position": {
+      "type": "object",
+      "description": "仓位管理与加仓序列参数。加仓系数应递减，盈利门槛应递增，且两者长度必须一致（由程序验证）。",
+      "additionalProperties": false,
+      "required": [
+        "entry_coefficient",
+        "add_coefficients",
+        "profit_step_atr",
+        "cool_down_bars"
+      ],
+      "properties": {
+        "entry_coefficient": {
+          "type": "number",
+          "description": "初始开仓系数，相对风险预算。1.0 表示 100% 风险预算，通常 1.0-1.5。",
+          "default": 1.2,
+          "minimum": 0.5,
+          "maximum": 2.0
+        },
+        "add_coefficients": {
+          "type": "array",
+          "description": "加仓系数序列，应递减且元素为正，长度与 profit_step_atr 相同。第一个系数对应第二次开仓（第一次加仓）。",
+          "default": [1.0, 0.8, 0.6, 0.4],
+          "items": {
+            "type": "number",
+            "minimum": 0.1,
+            "maximum": 1.5
+          },
+          "minItems": 1,
+          "maxItems": 8
+        },
+        "profit_step_atr": {
+          "type": "array",
+          "description": "加仓盈利门槛序列（初始风险倍数），应递增，长度与 add_coefficients 相同。浮盈需达到初始风险距离的该倍数才触发加仓。",
+          "default": [1.5, 2.5, 3.5, 4.5],
+          "items": {
+            "type": "number",
+            "minimum": 0.5,
+            "maximum": 10.0
+          },
+          "minItems": 1,
+          "maxItems": 8
+        },
+        "cool_down_bars": {
+          "type": "integer",
+          "description": "加仓冷却期（K线数），两次加仓之间至少需要此数量的K线，防止过度交易。",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 15
+        }
+      }
+    },
+    "bayesian": {
+      "type": "object",
+      "description": "贝叶斯融合判定阈值。三个阈值应严格递减：entry > add > emergency_cut。",
+      "additionalProperties": false,
+      "required": [
+        "entry_threshold",
+        "add_min_threshold",
+        "emergency_cut_threshold"
+      ],
+      "properties": {
+        "entry_threshold": {
+          "type": "number",
+          "description": "开仓最低贝叶斯综合得分，建议 0.65-0.85。",
+          "default": 0.7,
+          "minimum": 0.55,
+          "maximum": 0.90
+        },
+        "add_min_threshold": {
+          "type": "number",
+          "description": "加仓最低贝叶斯得分，必须严格小于 entry_threshold，通常低 0.1-0.2。",
+          "default": 0.55,
+          "minimum": 0.40,
+          "maximum": 0.75
+        },
+        "emergency_cut_threshold": {
+          "type": "number",
+          "description": "紧急减仓贝叶斯得分阈值，必须严格小于 add_min_threshold，通常 0.3-0.45。",
+          "default": 0.4,
+          "minimum": 0.25,
+          "maximum": 0.50
+        }
+      }
+    },
+    "stop_loss": {
+      "type": "object",
+      "description": "动态止损与利润保护参数。base_mult > min_mult。",
+      "additionalProperties": false,
+      "required": [
+        "base_mult",
+        "min_mult",
+        "angle_decay",
+        "breakeven_trigger_risk_mult",
+        "breakeven_buffer_atr"
+      ],
+      "properties": {
+        "base_mult": {
+          "type": "number",
+          "description": "初始止损 ATR 倍数，必须大于 min_mult，建议 2.0-3.0。",
+          "default": 2.5,
+          "minimum": 1.5,
+          "maximum": 4.0
+        },
+        "min_mult": {
+          "type": "number",
+          "description": "最紧止损 ATR 倍数（趋势角度最大时），必须小于 base_mult，建议 0.8-1.5。",
+          "default": 1.0,
+          "minimum": 0.5,
+          "maximum": 2.0
+        },
+        "angle_decay": {
+          "type": "number",
+          "description": "止损带宽指数衰减系数，越大收紧越快，建议 0.1-0.3。",
+          "default": 0.15,
+          "minimum": 0.05,
+          "maximum": 0.4
+        },
+        "breakeven_trigger_risk_mult": {
+          "type": "number",
+          "description": "保本止损触发倍数，浮盈达到总风险的该倍数时启动保本。",
+          "default": 2.0,
+          "minimum": 1.0,
+          "maximum": 4.0
+        },
+        "breakeven_buffer_atr": {
+          "type": "number",
+          "description": "保本止损额外缓冲（ATR），避免正常波动触发，建议 0.1-0.3。",
+          "default": 0.2,
+          "minimum": 0.0,
+          "maximum": 0.5
+        }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "description": "全局风控参数。所有值均基于万亿美金账户的极度保守原则设定，单个参数的上限均为安全硬限。",
+      "additionalProperties": false,
+      "required": [
+        "max_leverage",
+        "max_single_risk_pct",
+        "daily_loss_limit_pct",
+        "max_consecutive_losses"
+      ],
+      "properties": {
+        "max_leverage": {
+          "type": "number",
+          "description": "最大杠杆倍数（名义本金/权益），系统保守默认5，硬限不得超过 8。",
+          "default": 5.0,
+          "minimum": 1.5,
+          "maximum": 8.0
+        },
+        "max_single_risk_pct": {
+          "type": "number",
+          "description": "单笔最大风险占权益比例，例如 0.015 表示 1.5%，硬限 ≤ 0.02。",
+          "default": 0.015,
+          "minimum": 0.002,
+          "maximum": 0.02
+        },
+        "daily_loss_limit_pct": {
+          "type": "number",
+          "description": "日内最大亏损比例，触及则熔断暂停交易，硬限 ≤ 0.10。",
+          "default": 0.08,
+          "minimum": 0.02,
+          "maximum": 0.10
+        },
+        "max_consecutive_losses": {
+          "type": "integer",
+          "description": "连续亏损次数熔断阈值，达到后暂停策略，硬限 ≤ 6。",
+          "default": 5,
+          "minimum": 2,
+          "maximum": 6
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "description": "订单执行与拆单参数。",
+      "additionalProperties": false,
+      "required": [
+        "default_strategy",
+        "max_slices",
+        "slice_interval_ms"
+      ],
+      "properties": {
+        "default_strategy": {
+          "type": "string",
+          "description": "默认执行算法，adaptive 可根据市场自适应。",
+          "default": "adaptive",
+          "enum": ["adaptive", "twap", "passive", "aggressive"]
+        },
+        "max_slices": {
+          "type": "integer",
+          "description": "最大拆单数量，大单将被分成不超过此数量的子单，建议 5-20。",
+          "default": 10,
+          "minimum": 2,
+          "maximum": 25
+        },
+        "slice_interval_ms": {
+          "type": "integer",
+          "description": "子单发送间隔（毫秒），避免请求频率超限，最小 200ms。",
+          "default": 500,
+          "minimum": 200,
+          "maximum": 3000
+        }
+      }
+    },
+    "learning": {
+      "type": "object",
+      "description": "自适应在线学习参数。",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "update_interval_minutes",
+        "min_samples",
+        "optimization_metric"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "是否启用在线参数学习。生产环境建议先关闭，待充分验证后开启。",
+          "default": false
+        },
+        "update_interval_minutes": {
+          "type": "integer",
+          "description": "参数优化间隔（分钟），最小30分钟以降低过拟合风险，建议 30-120。",
+          "default": 60,
+          "minimum": 30,
+          "maximum": 240
+        },
+        "min_samples": {
+          "type": "integer",
+          "description": "最少交易样本数，低于此值不执行优化，避免小样本过拟合。",
+          "default": 30,
+          "minimum": 20,
+          "maximum": 200
+        },
+        "optimization_metric": {
+          "type": "string",
+          "description": "优化目标指标。",
+          "default": "calmar_ratio",
+          "enum": ["calmar_ratio", "sharpe_ratio", "sortino_ratio", "profit_factor"]
+        }
+      }
+    },
+    "model_hyperparams": {
+      "type": "object",
+      "description": "核心模型超参数，除非明确需要否则保持默认值。",
+      "additionalProperties": false,
+      "required": [
+        "particle_filter_num",
+        "gp_inducing_points",
+        "hmm_states"
+      ],
+      "properties": {
+        "particle_filter_num": {
+          "type": "integer",
+          "description": "粒子滤波粒子数量，越多越精确但计算量增大，建议 50-200。",
+          "default": 50,
+          "minimum": 30,
+          "maximum": 500
+        },
+        "gp_inducing_points": {
+          "type": "integer",
+          "description": "高斯过程诱导点数，控制近似精度，建议 30-150。",
+          "default": 50,
+          "minimum": 20,
+          "maximum": 150
+        },
+        "hmm_states": {
+          "type": "integer",
+          "description": "隐马尔可夫模型隐藏状态数，典型 2-4。",
+          "default": 3,
+          "minimum": 2,
+          "maximum": 5
+        }
+      }
+    }
+  }
+        }
