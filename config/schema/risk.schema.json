@@ -1,0 +1,633 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:spark-quant:schemas:risk.schema.json",
+  "title": "Spark Risk Management Configuration Schema",
+  "description": "Institutional-grade risk parameters for multi-trillion AUM. Validates config/risk.yaml structure, constraints, defaults, and regulatory alignment.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "max_leverage",
+    "position_limits",
+    "allowed_symbols"
+  ],
+  "definitions": {
+    "nonNegativeFraction": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0,
+      "multipleOf": 0.0001
+    },
+    "positiveInteger": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(-[a-zA-Z0-9]+(\\.[a-zA-Z0-9]+)*)?(\\+[a-zA-Z0-9]+(\\.[a-zA-Z0-9]+)*)?$"
+    }
+  },
+  "properties": {
+    "version": {
+      "$ref": "#/definitions/semver",
+      "description": "Configuration version (Semver 2.0).",
+      "default": "8.0.0"
+    },
+    "max_leverage": {
+      "type": "number",
+      "minimum": 1.0,
+      "maximum": 10.0,
+      "multipleOf": 0.1,
+      "description": "Global maximum leverage. Override per symbol with leverage_per_symbol.",
+      "default": 2.5
+    },
+    "leverage_per_symbol": {
+      "type": "object",
+      "description": "Symbol-specific max leverage. Key must be uppercase trading pair (e.g., BTCUSDT).",
+      "propertyNames": {
+        "pattern": "^[A-Z0-9]{2,20}$"
+      },
+      "additionalProperties": {
+        "type": "number",
+        "minimum": 1.0,
+        "maximum": 10.0,
+        "multipleOf": 0.1
+      },
+      "default": {}
+    },
+    "trading_schedule": {
+      "type": "object",
+      "description": "Restrict trading to specific time windows (UTC).",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "timezone": {
+          "type": "string",
+          "description": "IANA timezone name, e.g., 'UTC', 'America/New_York'.",
+          "default": "UTC"
+        },
+        "windows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["start", "end"],
+            "properties": {
+              "start": { "type": "string", "format": "time", "description": "HH:MM start time (inclusive)." },
+              "end": { "type": "string", "format": "time", "description": "HH:MM end time (inclusive)." },
+              "days": {
+                "type": "array",
+                "items": { "type": "string", "enum": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] },
+                "minItems": 1,
+                "description": "Days of week to apply this window."
+              }
+            }
+          },
+          "default": [{"start":"00:00","end":"23:59","days":["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]}]
+        }
+      }
+    },
+    "margin_management": {
+      "type": "object",
+      "description": "Margin and collateral settings.",
+      "additionalProperties": false,
+      "properties": {
+        "max_margin_per_order_pct": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "maximum": 0.1,
+          "description": "Max fraction of available equity that a single order may consume as margin.",
+          "default": 0.05
+        },
+        "leverage_margin_buffer_pct": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "description": "Additional margin buffer above initial margin requirement.",
+          "default": 0.05
+        },
+        "auto_deleverage_threshold": {
+          "type": "number",
+          "minimum": 1.0,
+          "maximum": 5.0,
+          "description": "Margin ratio (equity / margin) below which positions are automatically reduced.",
+          "default": 1.2
+        }
+      }
+    },
+    "order_rate": {
+      "type": "object",
+      "description": "Order rate limiting.",
+      "additionalProperties": false,
+      "properties": {
+        "max_orders_per_second": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 20.0,
+          "description": "Maximum orders per second averaged over the rate window.",
+          "default": 5.0
+        },
+        "window_sec": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 30.0,
+          "description": "Sliding window for rate limiting (seconds).",
+          "default": 1.0
+        },
+        "min_interval_ms": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 2000,
+          "description": "Minimum interval between consecutive orders (ms).",
+          "default": 100
+        },
+        "max_daily_orders": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 500000,
+          "description": "Maximum total orders per day (0 = unlimited).",
+          "default": 10000
+        }
+      }
+    },
+    "open_orders_limit": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Maximum number of concurrently open orders (0 = unlimited).",
+      "default": 10
+    },
+    "order_lifecycle": {
+      "type": "object",
+      "description": "Order modification / cancellation controls.",
+      "additionalProperties": false,
+      "properties": {
+        "max_cancel_rate": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "description": "Maximum cancellation ratio over the evaluation window.",
+          "default": 0.1
+        },
+        "max_amend_rate": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "description": "Maximum amendment ratio over the evaluation window.",
+          "default": 0.05
+        },
+        "evaluation_window_orders": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 10000,
+          "description": "Number of recent orders used to compute rates.",
+          "default": 200
+        },
+        "max_order_duration_sec": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 86400,
+          "description": "Max time an order can remain open before auto-cancellation (0 = unlimited).",
+          "default": 300
+        }
+      }
+    },
+    "self_trade_prevention": {
+      "type": "object",
+      "description": "Self-trade prevention settings.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "window_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5000,
+          "description": "Detection window (ms).",
+          "default": 200
+        }
+      }
+    },
+    "gap_protection": {
+      "type": "object",
+      "description": "Protection against extreme price gaps.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "max_gap_pct": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "description": "Maximum price gap from last known price to accept an order.",
+          "default": 0.02
+        }
+      }
+    },
+    "max_consecutive_losses": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 15,
+      "description": "Consecutive losing trades that trigger a circuit breaker.",
+      "default": 5
+    },
+    "daily_loss_limit_pct": {
+      "$ref": "#/definitions/nonNegativeFraction",
+      "description": "Maximum daily loss as a fraction of starting equity. Hard stop if exceeded.",
+      "default": 0.01
+    },
+    "daily_profit_lock": {
+      "type": "object",
+      "description": "Profit lock-in configuration.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "threshold_pct": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "description": "Profit threshold at which to lock in gains.",
+          "default": 0.03
+        },
+        "lock_duration_sec": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 86400,
+          "description": "Duration to maintain reduced exposure.",
+          "default": 3600
+        },
+        "reduce_exposure_by_pct": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "description": "Fraction of current exposure to reduce when profit lock activates.",
+          "default": 0.4
+        }
+      }
+    },
+    "max_single_risk_pct": {
+      "$ref": "#/definitions/nonNegativeFraction",
+      "maximum": 0.008,
+      "description": "Maximum risk per trade as a fraction of equity.",
+      "default": 0.005
+    },
+    "max_drawdown_pct": {
+      "$ref": "#/definitions/nonNegativeFraction",
+      "description": "Maximum allowable drawdown from peak equity. Triggers halt.",
+      "default": 0.10
+    },
+    "max_drawdown_duration_days": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 365,
+      "description": "Maximum number of consecutive days in drawdown before forced reduction. 0 = disabled.",
+      "default": 30
+    },
+    "drawdown_recovery": {
+      "type": "object",
+      "description": "Controls for resuming after a drawdown.",
+      "additionalProperties": false,
+      "properties": {
+        "min_recovery_time_sec": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 86400,
+          "description": "Minimum time after drawdown before re-entering positions.",
+          "default": 1800
+        },
+        "recovery_leverage_factor": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "description": "Fraction of normal max leverage to use during recovery.",
+          "default": 0.25
+        }
+      }
+    },
+    "circuit_breaker": {
+      "type": "object",
+      "description": "Circuit breaker configuration.",
+      "additionalProperties": false,
+      "properties": {
+        "cooldown_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 864000,
+          "description": "Base cooldown after a circuit breaker event (seconds).",
+          "default": 3600
+        },
+        "max_triggers_per_day": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Maximum triggers per day before escalation.",
+          "default": 3
+        },
+        "escalation_timeout_seconds": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 864000,
+          "description": "Extended timeout if max_triggers exceeded.",
+          "default": 28800
+        },
+        "reset_on_new_day": {
+          "type": "boolean",
+          "description": "Reset counters at the start of a new trading day (UTC).",
+          "default": true
+        },
+        "recovery_ramp_up_minutes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1440,
+          "description": "Time over which to gradually restore normal risk limits after a circuit breaker is lifted.",
+          "default": 30
+        }
+      }
+    },
+    "portfolio_risk": {
+      "type": "object",
+      "description": "Portfolio-level risk limits.",
+      "additionalProperties": false,
+      "properties": {
+        "es_limit_pct": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "maximum": 0.1,
+          "description": "Maximum Expected Shortfall as a fraction of equity.",
+          "default": 0.02
+        },
+        "es_confidence_level": {
+          "type": "number",
+          "minimum": 0.9,
+          "maximum": 0.999,
+          "description": "Confidence level for ES calculation.",
+          "default": 0.975
+        },
+        "var_limit_pct": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "description": "Maximum VaR as a fraction of equity. 0 = disabled.",
+          "default": 0.0
+        },
+        "var_confidence_level": {
+          "type": "number",
+          "minimum": 0.9,
+          "maximum": 0.999,
+          "description": "Confidence level for VaR calculation.",
+          "default": 0.99
+        }
+      }
+    },
+    "risk_metrics": {
+      "type": "object",
+      "description": "Parameters for risk calculations.",
+      "additionalProperties": false,
+      "properties": {
+        "risk_free_rate": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 0.2,
+          "description": "Annualised risk-free rate.",
+          "default": 0.04
+        },
+        "budget_update_interval_sec": {
+          "type": "number",
+          "minimum": 1.0,
+          "maximum": 300.0,
+          "description": "Interval at which risk budgets are recalculated (seconds).",
+          "default": 15.0
+        },
+        "vol_anomaly_threshold": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 10.0,
+          "description": "Annualised volatility above which is considered anomalous.",
+          "default": 5.0
+        }
+      }
+    },
+    "model_risk": {
+      "type": "object",
+      "description": "Model risk and drift detection settings.",
+      "additionalProperties": false,
+      "properties": {
+        "kl_drift_threshold": {
+          "type": "number",
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0,
+          "description": "KL divergence threshold for model drift detection.",
+          "default": 0.2
+        },
+        "prediction_error_limit": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "description": "Maximum acceptable prediction error (RMSE / price) over the evaluation window.",
+          "default": 0.02
+        },
+        "drift_check_interval_sec": {
+          "type": "number",
+          "minimum": 60,
+          "maximum": 86400,
+          "description": "Interval between model drift checks.",
+          "default": 3600
+        }
+      }
+    },
+    "execution_controls": {
+      "type": "object",
+      "description": "Execution-level constraints.",
+      "additionalProperties": false,
+      "properties": {
+        "max_slippage_pct": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "maximum": 0.05,
+          "description": "Maximum allowed slippage as fraction of order price.",
+          "default": 0.005
+        },
+        "max_order_book_imbalance_ratio": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "description": "Maximum ratio of order size to combined depth of top 5 levels in order book.",
+          "default": 0.05
+        },
+        "funding_fee_threshold": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "description": "Funding rate threshold (absolute) above which positions are reduced.",
+          "default": 0.002
+        },
+        "max_price_deviation_pct": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "maximum": 0.1,
+          "description": "Maximum allowed deviation from mark price for limit orders.",
+          "default": 0.03
+        },
+        "signal_delay_max_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5000,
+          "description": "Maximum tolerable signal delay; orders beyond this delay are rejected.",
+          "default": 200
+        }
+      }
+    },
+    "liquidity_constraints": {
+      "type": "object",
+      "description": "Minimum liquidity requirements before an order is placed.",
+      "additionalProperties": false,
+      "properties": {
+        "min_order_book_depth_usdt": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Minimum combined bid+ask depth within top levels to allow trading.",
+          "default": 50000
+        },
+        "max_bid_ask_spread_pct": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "description": "Maximum allowed bid/ask spread as fraction of mid price.",
+          "default": 0.001
+        }
+      }
+    },
+    "position_limits": {
+      "type": "object",
+      "description": "Position sizing and concentration constraints.",
+      "additionalProperties": false,
+      "required": ["min_order_notional"],
+      "properties": {
+        "max_position_notional": {
+          "type": "number",
+          "minimum": 0,
+          "multipleOf": 1,
+          "description": "Maximum notional value per symbol (0 = unlimited).",
+          "default": 0
+        },
+        "max_total_notional": {
+          "type": "number",
+          "minimum": 0,
+          "multipleOf": 1,
+          "description": "Maximum total notional value across all symbols (0 = unlimited).",
+          "default": 0
+        },
+        "position_concentration_limit": {
+          "$ref": "#/definitions/nonNegativeFraction",
+          "description": "Maximum fraction of total equity that a single symbol may represent.",
+          "default": 0.2
+        },
+        "max_order_notional": {
+          "type": "number",
+          "minimum": 0,
+          "multipleOf": 1,
+          "description": "Maximum notional value for a single order (0 = unlimited).",
+          "default": 0
+        },
+        "min_order_notional": {
+          "type": "number",
+          "minimum": 1,
+          "multipleOf": 1,
+          "description": "Minimum notional value for a single order (dust prevention).",
+          "default": 100
+        }
+      }
+    },
+    "allowed_order_types": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["LIMIT", "MARKET", "STOP_LOSS", "STOP_LOSS_LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT", "TRAILING_STOP_MARKET"]
+      },
+      "uniqueItems": true,
+      "description": "Permitted order types. Default includes LIMIT and MARKET for emergency actions.",
+      "default": ["LIMIT", "MARKET"]
+    },
+    "allowed_symbols": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "pattern": "^[A-Z0-9]{2,20}$" },
+      "uniqueItems": true,
+      "minItems": 1,
+      "description": "Whitelist of allowed trading symbols. Must contain at least one uppercase symbol.",
+      "default": ["BTCUSDT"]
+    },
+    "min_equity_to_trade": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Minimum account equity (in quote currency) required to start or continue trading.",
+      "default": 10000
+    },
+    "max_portfolio_turnover_rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "description": "Maximum allowed daily portfolio turnover (total traded notional / equity). 0 = unlimited.",
+      "default": 10
+    },
+    "min_profit_factor": {
+      "type": "number",
+      "minimum": 0.5,
+      "maximum": 5.0,
+      "description": "Minimum required profit factor (gross profit / gross loss) over the evaluation window to keep strategy active.",
+      "default": 1.2
+    },
+    "stress_test_scenarios": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "price_shock_pct"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "price_shock_pct": { "type": "number", "minimum": -1.0, "maximum": 1.0 },
+          "volatility_multiplier": { "type": "number", "minimum": 0.0, "maximum": 10.0, "default": 1.0 },
+          "correlation_shock": { "type": "number", "minimum": -1.0, "maximum": 1.0, "default": 0.0 },
+          "liquidity_shock_pct": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "default": 0.0,
+            "description": "Fraction of normal liquidity to remove (0=no change, 1=complete liquidity drought)."
+          },
+          "duration_sec": { "type": "number", "minimum": 0, "default": 3600 }
+        }
+      },
+      "description": "Stress-test scenarios for risk evaluation.",
+      "default": []
+    },
+    "emergency_stop": {
+      "type": "object",
+      "description": "Global emergency stop configuration.",
+      "additionalProperties": false,
+      "properties": {
+        "cancel_all_on_disconnect": {
+          "type": "boolean",
+          "default": true
+        },
+        "disconnect_timeout_sec": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 60,
+          "description": "Time before triggering emergency stop on disconnect (seconds).",
+          "default": 10
+        }
+      }
+    },
+    "risk_reporting": {
+      "type": "object",
+      "description": "Risk report generation settings.",
+      "additionalProperties": false,
+      "properties": {
+        "interval_sec": {
+          "type": "number",
+          "minimum": 10,
+          "maximum": 86400,
+          "description": "Interval between automated risk reports.",
+          "default": 3600
+        },
+        "alert_on_threshold": {
+          "type": "boolean",
+          "default": true
+        },
+        "storage_retention_days": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 7300,
+          "description": "Number of days to retain risk reports (e.g., 1825 for 5 years to meet MiFID II).",
+          "default": 1825
+        },
+        "recipients": {
+          "type": "array",
+          "items": { "type": "string", "format": "email" },
+          "uniqueItems": true,
+          "description": "Email addresses to receive risk report notifications."
+        }
+      }
+    }
+  }
+}
