@@ -1,0 +1,474 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "${DS_PROMETHEUS}",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "target": {
+          "limit": 100,
+          "matchAny": false,
+          "tags": [],
+          "type": "dashboard"
+        },
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "火种量化交易系统核心交易监控仪表板，涵盖盈亏、风险、订单执行、模型信号。适用于万亿美金级别账户的实时监控。所有指标按交易对和部署环境过滤。",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "tags": [],
+      "title": "系统健康",
+      "type": "dashboards",
+      "url": "/d/spark-system-health"
+    },
+    {
+      "asDropdown": false,
+      "icon": "doc",
+      "tags": [],
+      "title": "运行手册",
+      "type": "link",
+      "url": "https://docs.spark.example.com/runbook"
+    }
+  ],
+  "liveNow": true,
+  "panels": [
+    {
+      "collapsed": false,
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 100,
+      "panels": [],
+      "title": "盈亏与权益",
+      "type": "row"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "decimals": 2,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red"}, {"color": "green", "value": 0}]},
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 1},
+      "id": 101,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "risk_budget_equity{symbol=~\"$symbol\",env=\"$environment\"} - (risk_budget_equity{symbol=~\"$symbol\",env=\"$environment\"} offset 1d) or vector(0)",
+          "refId": "A"
+        }
+      ],
+      "title": "当日盈亏",
+      "type": "stat"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "decimals": 2,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red"}, {"color": "green", "value": 0}]},
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 5, "w": 4, "x": 4, "y": 1},
+      "id": 102,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "risk_budget_equity{symbol=~\"$symbol\",env=\"$environment\"}",
+          "refId": "A"
+        }
+      ],
+      "title": "当前权益",
+      "type": "stat"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "decimals": 2,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green"}, {"color": "#EAB839", "value": 0.8}, {"color": "red", "value": 0.95}]},
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": {"h": 5, "w": 4, "x": 8, "y": 1},
+      "id": 103,
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "risk_budget_leverage{symbol=~\"$symbol\",env=\"$environment\"} / $max_leverage",
+          "refId": "A"
+        }
+      ],
+      "title": "杠杆使用率",
+      "type": "stat"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "decimals": 2,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green"}, {"color": "#EAB839", "value": 0.05}, {"color": "red", "value": 0.15}]},
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": {"h": 5, "w": 4, "x": 12, "y": 1},
+      "id": 104,
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "abs(risk_budget_equity{symbol=~\"$symbol\",env=\"$environment\"} - (risk_budget_equity{symbol=~\"$symbol\",env=\"$environment\"} offset 1d)) / (risk_budget_equity{symbol=~\"$symbol\",env=\"$environment\"} > 0 or on() vector(1))",
+          "refId": "A"
+        }
+      ],
+      "title": "日波动率",
+      "type": "stat"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "decimals": 0,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green"}, {"color": "red", "value": 4}]},
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 5, "w": 4, "x": 16, "y": 1},
+      "id": 105,
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "risk_budget_consecutive_losses{env=\"$environment\"}",
+          "refId": "A"
+        }
+      ],
+      "title": "连续亏损",
+      "type": "stat"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [{"options": {"0": {"text": "正常"}, "1": {"text": "熔断"}}, "type": "value"}],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green"}, {"color": "red", "value": 1}]},
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 5, "w": 4, "x": 20, "y": 1},
+      "id": 106,
+      "options": {
+        "colorMode": "background",
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "risk_budget_circuit_breaker{env=\"$environment\"}",
+          "refId": "A"
+        }
+      ],
+      "title": "熔断",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 6},
+      "id": 200,
+      "panels": [],
+      "title": "持仓与风险",
+      "type": "row"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 7},
+      "id": 201,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {"expr": "risk_budget_total_exposure{symbol=~\"$symbol\",env=\"$environment\"}", "legendFormat": "总敞口", "refId": "A"},
+        {"expr": "risk_budget_max_exposure{symbol=~\"$symbol\",env=\"$environment\"}", "legendFormat": "最大允许", "refId": "B"}
+      ],
+      "title": "敞口 vs 限额",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 7},
+      "id": 202,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {"expr": "risk_budget_es_ratio{symbol=~\"$symbol\",env=\"$environment\"}", "legendFormat": "ES占比", "refId": "A"}
+      ],
+      "title": "预期亏损占比",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 7},
+      "id": 203,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {"expr": "active_positions_count{symbol=~\"$symbol\",env=\"$environment\"}", "legendFormat": "持仓数", "refId": "A"}
+      ],
+      "title": "活跃持仓",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 15},
+      "id": 204,
+      "options": {"legend": {"displayMode": "table"}},
+      "targets": [
+        {
+          "expr": "1 - risk_budget_equity{env=\"$environment\"} / max_over_time(risk_budget_equity{env=\"$environment\"}[$__range])",
+          "legendFormat": "最大回撤",
+          "refId": "A"
+        }
+      ],
+      "title": "最大回撤",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 15},
+      "id": 205,
+      "options": {"legend": {"displayMode": "table"}},
+      "targets": [
+        {"expr": "rate(order_filled_total{env=\"$environment\"}[$__rate_interval])", "legendFormat": "成交速率", "refId": "A"},
+        {"expr": "rate(order_submitted_total{env=\"$environment\"}[$__rate_interval])", "legendFormat": "提交速率", "refId": "B"}
+      ],
+      "title": "交易频率",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 23},
+      "id": 300,
+      "panels": [],
+      "title": "订单与执行",
+      "type": "row"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 24},
+      "id": 301,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {"expr": "rate(order_submitted_total{env=\"$environment\"}[$__rate_interval])", "legendFormat": "提交", "refId": "A"},
+        {"expr": "rate(order_filled_total{env=\"$environment\"}[$__rate_interval])", "legendFormat": "成交", "refId": "B"},
+        {"expr": "rate(order_rejected_total{env=\"$environment\"}[$__rate_interval])", "legendFormat": "拒绝", "refId": "C"}
+      ],
+      "title": "订单速率",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 24},
+      "id": 302,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.99, rate(order_execution_latency_seconds_bucket{env=\"$environment\"}[$__rate_interval]))", "legendFormat": "p99", "refId": "A"},
+        {"expr": "histogram_quantile(0.50, rate(order_execution_latency_seconds_bucket{env=\"$environment\"}[$__rate_interval]))", "legendFormat": "p50", "refId": "B"}
+      ],
+      "title": "执行延迟",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 24},
+      "id": 303,
+      "options": {"colorMode": "background", "reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "auto"},
+      "targets": [{"expr": "open_orders_count{symbol=~\"$symbol\",env=\"$environment\"}", "refId": "A"}],
+      "title": "挂单",
+      "type": "stat"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 24},
+      "id": 304,
+      "options": {"colorMode": "none", "reduceOptions": {"calcs": ["lastNotNull"]}, "textMode": "auto"},
+      "targets": [{"expr": "increase(executed_orders_count{symbol=~\"$symbol\",env=\"$environment\"}[$__range])", "refId": "A"}],
+      "title": "今日成交",
+      "type": "stat"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "gridPos": {"h": 4, "w": 8, "x": 16, "y": 28},
+      "id": 305,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [{"expr": "rate(event_bus_dropped_total{env=\"$environment\"}[$__rate_interval])", "legendFormat": "丢弃", "refId": "A"}],
+      "title": "事件丢弃",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 32},
+      "id": 400,
+      "panels": [],
+      "title": "模型与信号",
+      "type": "row"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "fixed"},
+          "mappings": [{"options": {"0": {"text": "震荡"}, "1": {"text": "发散"}, "2": {"text": "回归"}, "3": {"text": "恢复"}}, "type": "value"}],
+          "unit": "none"
+        }
+      },
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 33},
+      "id": 401,
+      "options": {"mergeValues": false, "rowHeight": 0.9, "showValue": "auto", "alignValue": "left", "legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [{"expr": "trend_state_current{symbol=~\"$symbol\",env=\"$environment\"}", "legendFormat": "状态", "refId": "A"}],
+      "title": "趋势状态",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "thresholds": {"steps": [{"color": "red"}, {"color": "green", "value": 0.6}]},
+          "unit": "short"
+        }
+      },
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 33},
+      "id": 402,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [{"expr": "gp_classifier_probability{symbol=~\"$symbol\",env=\"$environment\"}", "legendFormat": "贝叶斯得分", "refId": "A"}],
+      "title": "贝叶斯得分",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 39},
+      "id": 403,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {"expr": "particle_filter_prob_divergence{symbol=~\"$symbol\",env=\"$environment\"}", "legendFormat": "P(发散)", "refId": "A"},
+        {"expr": "particle_filter_ess_ratio{symbol=~\"$symbol\",env=\"$environment\"}", "legendFormat": "有效样本率", "refId": "B"}
+      ],
+      "title": "粒子滤波诊断",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${DS_PROMETHEUS}",
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 39},
+      "id": 404,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [{"expr": "gp_uncertainty{symbol=~\"$symbol\",env=\"$environment\"}", "legendFormat": "不确定性", "refId": "A"}],
+      "title": "高斯过程不确定性",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 36,
+  "style": "dark",
+  "tags": ["spark", "trading", "institutional"],
+  "templating": {
+    "list": [
+      {
+        "current": {"selected": true, "text": "Prometheus", "value": "Prometheus"},
+        "hide": 0,
+        "label": "数据源",
+        "name": "DS_PROMETHEUS",
+        "query": "prometheus",
+        "type": "datasource"
+      },
+      {
+        "current": {"selected": true, "text": "prod", "value": "prod"},
+        "hide": 0,
+        "label": "环境",
+        "name": "environment",
+        "options": [{"selected": true, "text": "prod", "value": "prod"}, {"text": "dr", "value": "dr"}],
+        "query": "prod,dr",
+        "type": "custom"
+      },
+      {
+        "current": {"selected": true, "text": "BTCUSDT", "value": "BTCUSDT"},
+        "hide": 0,
+        "label": "交易对",
+        "name": "symbol",
+        "options": [{"selected": true, "text": "BTCUSDT", "value": "BTCUSDT"}, {"text": "ETHUSDT", "value": "ETHUSDT"}],
+        "query": "BTCUSDT,ETHUSDT",
+        "type": "custom"
+      },
+      {
+        "current": {"selected": true, "text": "5.0", "value": "5.0"},
+        "hide": 2,
+        "label": "最大杠杆",
+        "name": "max_leverage",
+        "query": "5.0",
+        "type": "constant"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h", "2h", "1d"],
+    "time_options": ["5m", "15m", "1h", "6h", "12h", "24h", "2d", "7d", "30d"]
+  },
+  "timezone": "utc",
+  "title": "火种交易监控",
+  "uid": "spark-trading-overview-v5",
+  "version": 5,
+  "weekStart": ""
+}
