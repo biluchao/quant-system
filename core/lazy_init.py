@@ -1,193 +1,272 @@
-# -*- coding: utf-8 -*-
-# 铁律遵守声明：本文件严格执行八项铁律（类型/接口/事件/异常/配置/命名统一 + 三层防线 + 幂等审计）
-"""
-延迟初始化容器 —— 打破循环依赖
+"""core/lazy_init.py — 延迟初始化（打破循环依赖）
 
-问题：risk/account/strategy 互相引用导致 import 循环
-解决：模块注册时只存工厂函数，首次访问时才实例化
-"""
+铁律声明：本文件遵守
+- 类型统一：所有接口参数有类型注解
+- 命名统一：类 PascalCase，方法动词开头
+- 异常统一：初始化失败抛精确异常
+- 幂等审计：初始化结果可查询
 
+设计问题：
+    risk → account → risk 这类循环依赖在量化系统中很常见。
+    直接 import 会导致 ImportError 或初始化死锁。
+
+解决方案：
+    1. LazyRef：持有对尚未初始化的组件的弱引用占位符
+    2. LazyInitializer：延迟工厂，首次访问时才创建实例
+    3. 通过 setter 注入打破循环（init 时传 LazyRef，start 时解析）
+
+使用模式：
+    # 模块A 需要模块B，但B也可能需要A
+    class ModuleA:
+        def __init__(self, bus, b_ref: LazyRef):
+            self._b = b_ref  # 持有引用，不立即访问
+
+        async def start(self):
+            b = await self._b.resolve()  # 此时B已初始化
+            self._b_real = b
+"""
 from __future__ import annotations
 
 import asyncio
-import inspect
 import logging
-import threading
-from typing import Any, Callable, Dict, Optional, Type, TypeVar, cast
+import time
+from typing import Any, Awaitable, Callable, Optional, TypeVar
 
-from core.types import ErrorCode, QuantError, SystemMode, SystemStatus
+from core.types import TraceId, new_trace_id
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
 
-class LazyInitError(QuantError):
+# ═══════════════════════════════════════════════════════════════
+# 异常
+# ═══════════════════════════════════════════════════════════════
+
+class LazyInitError(Exception):
     """延迟初始化异常"""
-
-    def __init__(self, module_name: str, reason: str):
-        super().__init__(
-            code=ErrorCode.SYSTEM_ERROR,
-            message=f"LazyInit failed for '{module_name}': {reason}",
-            context={"module": module_name, "reason": reason},
-        )
+    code = 2100
 
 
-class LazyContainer:
+class CircularResolutionError(LazyInitError):
+    """循环解析异常（解析链形成环）"""
+    code = 2101
+
+
+# ═══════════════════════════════════════════════════════════════
+# 延迟引用
+# ═══════════════════════════════════════════════════════════════
+
+class LazyRef:
+    """延迟引用占位符
+
+    持有对目标组件的引用，但不立即解析。
+    首次 resolve() 时才获取真实实例。
+
+    特性：
+    - 可追踪解析链（防止循环）
+    - 可缓存解析结果（幂等）
+    - 支持同步/异步工厂
     """
-    延迟初始化容器
 
-    用法：
-        container = LazyContainer()
-        container.register("risk_engine", RiskEngine, dependencies=["config", "event_bus"])
-        engine = container.resolve("risk_engine")  # 首次访问时实例化
+    def __init__(
+        self,
+        name: str,
+        factory: Optional[Callable[..., Any]] = None,
+        registry: Optional[Any] = None,
+    ) -> None:
+        """
+        Args:
+            name: 目标组件名
+            factory: 创建组件的工厂函数（可选）
+            registry: 服务注册表（用于按名查找，如 ServiceLocator）
+        """
+        if not name:
+            raise ValueError("name 不能为空")
+        self._name = name
+        self._factory = factory
+        self._registry = registry
+        self._instance: Optional[Any] = None
+        self._resolved = False
+        self._resolving = False
+        self._trace_id: TraceId = new_trace_id()
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def is_resolved(self) -> bool:
+        return self._resolved
+
+    async def resolve(self) -> Any:
+        """解析真实实例
+
+        优先级：
+        1. 已缓存的实例
+        2. registry 中查找
+        3. factory 创建
+
+        检测循环解析：如果解析链中再次出现当前 ref，则报循环错误。
+        """
+        if self._resolved and self._instance is not None:
+            return self._instance
+
+        # 检测循环
+        if self._resolving:
+            raise CircularResolutionError(
+                f"检测到循环解析: {self._name} (trace: {self._trace_id})"
+            )
+
+        self._resolving = True
+        start_time = time.monotonic()
+
+        try:
+            # 1. 从注册表查找
+            if self._registry is not None:
+                try:
+                    instance = self._registry.resolve(self._name)
+                    if instance is not None:
+                        self._instance = instance
+                        self._resolved = True
+                        return instance
+                except (NotFoundError, AttributeError):
+                    pass
+
+            # 2. 从工厂创建
+            if self._factory is not None:
+                result = self._factory()
+                # 支持异步工厂
+                if asyncio.iscoroutine(result):
+                    result = await result
+                if result is None:
+                    raise LazyInitError(
+                        f"工厂返回 None: {self._name}"
+                    )
+                self._instance = result
+                self._resolved = True
+                return result
+
+            raise LazyInitError(
+                f"无法解析组件 {self._name}（无 registry 且无 factory）"
+            )
+
+        finally:
+            self._resolving = False
+            elapsed_ms = (time.monotonic() - start_time) * 1000
+            if elapsed_ms > 100:
+                logger.warning(
+                    f"LazyRef 解析耗时 {elapsed_ms:.1f}ms: {self._name}"
+                )
+
+    def set_instance(self, instance: Any) -> None:
+        """手动设置实例（用于依赖注入）"""
+        self._instance = instance
+        self._resolved = True
+
+    def reset(self) -> None:
+        """重置（仅测试用）"""
+        self._instance = None
+        self._resolved = False
+        self._resolving = False
+
+
+# ═══════════════════════════════════════════════════════════════
+# 延迟初始化管理器
+# ═══════════════════════════════════════════════════════════════
+
+class LazyInitializer:
+    """延迟初始化管理器
+
+    管理一批 LazyRef，支持批量解析与状态查询。
     """
 
-    def __init__(self) -> None:
-        self._factories: Dict[str, Callable[..., Any]] = {}
-        self._dependencies: Dict[str, list[str]] = {}
-        self._singletons: Dict[str, Any] = {}
-        self._instantiating: set[str] = set()  # 检测循环依赖
-        self._lock = threading.RLock()
+    def __init__(self, registry: Optional[Any] = None) -> None:
+        self._refs: Dict[str, LazyRef] = {}
+        self._registry = registry
 
     def register(
         self,
         name: str,
-        factory: Callable[..., T],
-        dependencies: Optional[list[str]] = None,
-    ) -> None:
+        factory: Optional[Callable[..., Any]] = None,
+    ) -> LazyRef:
+        """注册一个延迟引用"""
+        if name in self._refs:
+            return self._refs[name]
+
+        ref = LazyRef(name, factory=factory, registry=self._registry)
+        self._refs[name] = ref
+        return ref
+
+    def get(self, name: str) -> LazyRef:
+        """获取已注册的引用"""
+        if name not in self._refs:
+            raise NotFoundError(f"未注册的 LazyRef: {name}")
+        return self._refs[name]
+
+    async def resolve_all(self, names: Optional[List[str]] = None) -> Dict[str, Any]:
+        """批量解析
+
+        Args:
+            names: 要解析的名称列表，None 则解析全部
+
+        Returns:
+            名称 -> 实例 的映射
         """
-        注册模块工厂
+        targets = names or list(self._refs.keys())
+        results: Dict[str, Any] = {}
 
-        三层防线第1层：输入校验
-        """
-        if not name or not isinstance(name, str):
-            raise LazyInitError(name or "<empty>", "Module name must be non-empty string")
-        if not callable(factory):
-            raise LazyInitError(name, "Factory must be callable")
+        for name in targets:
+            if name not in self._refs:
+                raise NotFoundError(f"未注册的 LazyRef: {name}")
+            results[name] = await self._refs[name].resolve()
 
-        with self._lock:
-            self._factories[name] = factory
-            self._dependencies[name] = dependencies or []
+        return results
 
-    def resolve(self, name: str) -> Any:
-        """
-        解析模块实例（单例，线程安全）
+    def get_unresolved(self) -> List[str]:
+        """获取尚未解析的引用名"""
+        return [n for n, ref in self._refs.items() if not ref.is_resolved]
 
-        首次调用时实例化，后续返回缓存实例
-        """
-        # 已实例化，直接返回
-        if name in self._singletons:
-            return self._singletons[name]
+    def get_status(self) -> Dict[str, Any]:
+        """获取所有引用的状态"""
+        return {
+            name: {
+                "resolved": ref.is_resolved,
+            }
+            for name, ref in self._refs.items()
+        }
 
-        with self._lock:
-            # 双重检查
-            if name in self._singletons:
-                return self._singletons[name]
-
-            if name not in self._factories:
-                raise LazyInitError(name, "Module not registered")
-
-            # 检测循环依赖
-            if name in self._instantiating:
-                raise LazyInitError(
-                    name,
-                    f"Circular dependency detected. Chain: {list(self._instantiating)} -> {name}",
-                )
-
-            self._instantiating.add(name)
-
-            try:
-                # 解析依赖
-                deps = self._dependencies.get(name, [])
-                resolved_deps: Dict[str, Any] = {}
-                for dep_name in deps:
-                    if dep_name == name:
-                        continue
-                    resolved_deps[dep_name] = self.resolve(dep_name)
-
-                # 实例化
-                factory = self._factories[name]
-                sig = inspect.signature(factory)
-                kwargs: Dict[str, Any] = {}
-
-                # 尝试按参数名匹配依赖
-                for param_name, param in sig.parameters.items():
-                    if param_name in resolved_deps:
-                        kwargs[param_name] = resolved_deps[param_name]
-                    elif param.annotation and hasattr(param.annotation, "__name__"):
-                        # 按类型匹配
-                        for dep in resolved_deps.values():
-                            if isinstance(dep, param.annotation):
-                                kwargs[param_name] = dep
-                                break
-
-                instance = factory(**kwargs)
-                self._singletons[name] = instance
-                logger.info(f"LazyInit: module '{name}' instantiated successfully")
-
-                # 三层防线第2层：业务校验
-                if instance is None:
-                    raise LazyInitError(name, "Factory returned None")
-
-                return instance
-
-            finally:
-                self._instantiating.discard(name)
-
-    def has(self, name: str) -> bool:
-        """检查模块是否已注册"""
-        return name in self._factories
-
-    def is_instantiated(self, name: str) -> bool:
-        """检查模块是否已实例化"""
-        return name in self._singletons
-
-    def reset(self, name: str) -> None:
-        """重置模块实例（用于测试或热重载）"""
-        with self._lock:
-            self._singletons.pop(name, None)
-            logger.info(f"LazyInit: module '{name}' reset")
-
-    def shutdown_all(self) -> None:
-        """关闭所有模块（调用 close()/shutdown() 方法）"""
-        with self._lock:
-            for name, instance in list(self._singletons.items()):
-                try:
-                    if hasattr(instance, "close"):
-                        instance.close()
-                    elif hasattr(instance, "shutdown"):
-                        instance.shutdown()
-                    logger.info(f"LazyInit: module '{name}' shut down")
-                except Exception as e:
-                    logger.error(f"LazyInit: error shutting down '{name}': {e}")
-            self._singletons.clear()
+    def reset_all(self) -> None:
+        """重置全部（仅测试用）"""
+        for ref in self._refs.values():
+            ref.reset()
 
 
-# 全局延迟初始化容器
-_global_container: Optional[LazyContainer] = None
-_container_lock = threading.Lock()
+# ═══════════════════════════════════════════════════════════════
+# 装饰器：标记需要延迟解析的字段
+# ═══════════════════════════════════════════════════════════════
 
+def lazy_property(func: Callable[[Any], LazyRef]):
+    """延迟属性装饰器
 
-def get_container() -> LazyContainer:
-    """获取全局延迟初始化容器（单例）"""
-    global _global_container
-    if _global_container is None:
-        with _container_lock:
-            if _global_container is None:
-                _global_container = LazyContainer()
-    return _global_container
+    用法：
+        class Service:
+            @lazy_property
+            def db(self) -> LazyRef:
+                return LazyRef("database", registry=locator)
 
+            async def use_db(self):
+                db = await self.db.resolve()
+                return db.query(...)
+    """
+    attr_name = f"_lazy_{func.__name__}"
 
-def register_module(
-    name: str,
-    factory: Callable[..., Any],
-    dependencies: Optional[list[str]] = None,
-) -> None:
-    """快捷注册模块"""
-    get_container().register(name, factory, dependencies)
+    @property
+    def wrapper(self):
+        if not hasattr(self, attr_name):
+            ref = func(self)
+            setattr(self, attr_name, ref)
+        return getattr(self, attr_name)
 
+    return wrapper
 
-def resolve_module(name: str) -> Any:
-    """快捷解析模块"""
-    return get_container().resolve(name)
